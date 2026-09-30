@@ -21,6 +21,11 @@ export function VersionBar({ image }: { image: ImageRecord }) {
             v{v.version}
             {v.status === 'submitted' ? ' 已冻结' : ' 草稿'}
             {v.basedOn != null && <em>（返工自 v{v.basedOn}）</em>}
+            {v.mergeOf && (
+              <em>
+                （合并 v{v.mergeOf.a} + v{v.mergeOf.b}，基线 v{v.mergeOf.base}）
+              </em>
+            )}
           </span>
         ))}
       </div>

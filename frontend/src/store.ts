@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { Category, ImageRecord, ImportResult, Point } from './types';
+import type { Category, ImageRecord, ImportResult, MergeResolution, MergeSession, Point } from './types';
 import {
   addDraftObject,
   createContour,
@@ -15,13 +15,16 @@ import {
 import { createImage } from './core/versioning';
 import type { LoadedImage } from './core/images';
 import { exportProject, importProject } from './core/exchange';
+import { applyMergeSession, createMergeSession } from './core/merge';
 import { uid } from './core/geometry';
+import { nowIso } from './core/versioning';
 
 interface AppState {
   images: ImageRecord[];
   categories: Category[];
   selectedImageId: string | null;
   lastImport: ImportResult | null;
+  mergeSessions: MergeSession[];
   addImages: (loaded: LoadedImage[]) => string[];
   selectImage: (id: string | null) => void;
   addObject: (categoryId: string) => string | null;
@@ -40,6 +43,11 @@ interface AppState {
   exportJson: () => string;
   importJson: (raw: string) => ImportResult;
   resetAll: () => void;
+  startMerge: (aVersion: number, bVersion: number) => MergeSession;
+  resolveConflict: (conflictId: string, choice: MergeResolution) => void;
+  unresolveConflict: (conflictId: string) => void;
+  cancelMerge: () => void;
+  completeMerge: (note?: string) => void;
 }
 
 function mutateImage(images: ImageRecord[], id: string | null, fn: (img: ImageRecord) => ImageRecord): ImageRecord[] {
@@ -54,6 +62,7 @@ export const useStore = create<AppState>()(
       categories: defaultCategories(),
       selectedImageId: null,
       lastImport: null,
+      mergeSessions: [],
 
       addImages: (loaded) => {
         const ids: string[] = [];
@@ -190,7 +199,49 @@ export const useStore = create<AppState>()(
       },
 
       resetAll: () =>
-        set({ images: [], categories: defaultCategories(), selectedImageId: null, lastImport: null }),
+        set({ images: [], categories: defaultCategories(), selectedImageId: null, lastImport: null, mergeSessions: [] }),
+
+      startMerge: (aVersion, bVersion) => {
+        const { images, selectedImageId, mergeSessions } = get();
+        const image = images.find((i) => i.id === selectedImageId);
+        if (!image) throw new Error('没有选中图片');
+        const session = createMergeSession(image, aVersion, bVersion);
+        // 同一图片同时只进行一场合并；新会话替换旧会话
+        set({ mergeSessions: [...mergeSessions.filter((m) => m.imageId !== image.id), session] });
+        return session;
+      },
+
+      resolveConflict: (conflictId, choice) =>
+        set((s) => ({
+          mergeSessions: s.mergeSessions.map((m) =>
+            m.imageId === s.selectedImageId
+              ? { ...m, resolutions: { ...m.resolutions, [conflictId]: choice }, updatedAt: nowIso() }
+              : m,
+          ),
+        })),
+
+      unresolveConflict: (conflictId) =>
+        set((s) => ({
+          mergeSessions: s.mergeSessions.map((m) => {
+            if (m.imageId !== s.selectedImageId) return m;
+            const resolutions = { ...m.resolutions };
+            delete resolutions[conflictId];
+            return { ...m, resolutions, updatedAt: nowIso() };
+          }),
+        })),
+
+      cancelMerge: () =>
+        set((s) => ({ mergeSessions: s.mergeSessions.filter((m) => m.imageId !== s.selectedImageId) })),
+
+      completeMerge: (note) => {
+        const { images, selectedImageId, mergeSessions } = get();
+        const session = mergeSessions.find((m) => m.imageId === selectedImageId);
+        if (!session) throw new Error('当前没有进行中的合并');
+        set({
+          images: mutateImage(images, selectedImageId, (img) => applyMergeSession(img, session, note)),
+          mergeSessions: mergeSessions.filter((m) => m.imageId !== selectedImageId),
+        });
+      },
     }),
     { name: 'annotation-platform-v1' },
   ),

@@ -131,3 +131,42 @@ svg.drawing { cursor: crosshair; }
 }
 
 .empty { padding: 60px; text-align: center; }
+.merge-panel {
+  border-top: 1px solid #2a2f3a;
+  padding: 10px 14px;
+}
+.merge-panel h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+.merge-setup {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.merge-setup label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.error { color: #f87171; font-size: 12px; margin: 6px 0 0; }
+.conflict-list { list-style: none; margin: 8px 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.conflict {
+  border: 1px solid #3a4152;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.conflict.resolved { border-color: #22c55e; }
+.conflict-msg { margin: 0 0 6px; font-size: 13px; }
+.conflict-values { display: flex; gap: 10px; margin-bottom: 6px; }
+.val-col { flex: 1; background: #1b1f27; border-radius: 6px; padding: 6px 8px; font-size: 12px; }
+.val-col.picked { outline: 1px solid #22c55e; }
+.val-col em { display: block; color: #9aa4b2; font-style: normal; margin-bottom: 2px; }
+.val.deleted { color: #f87171; }
+.conflict-actions, .merge-actions { display: flex; gap: 8px; align-items: center; }
+.merge-actions { margin-top: 8px; }

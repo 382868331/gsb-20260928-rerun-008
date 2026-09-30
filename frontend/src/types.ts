@@ -32,7 +32,53 @@ export interface ImageVersion {
   submittedAt: string | null;
   /** 返工来源版本号；为 null 表示首次提交 */
   basedOn: number | null;
+  /** 合并来源：本次提交由 base 版本的两条修订（a、b）合并而来 */
+  mergeOf?: MergeSources;
   note?: string;
+}
+
+export interface MergeSources {
+  base: number;
+  a: number;
+  b: number;
+}
+
+export type MergePartKind =
+  | 'object-existence'
+  | 'category'
+  | 'outline'
+  | 'contour-existence'
+  | 'hole'
+  | 'hole-existence';
+
+/** 一处需要用户裁决的冲突：同一物体同一部分被两条修订改成了不同结果 */
+export interface MergeConflict {
+  /** 稳定 id，用于记录用户选择 */
+  id: string;
+  objectId: string;
+  part: MergePartKind;
+  contourId?: string;
+  holeId?: string;
+  /** 基线版本中的值（删除类冲突时可能为 undefined 表示不存在） */
+  baseValue: unknown;
+  aValue: unknown;
+  bValue: unknown;
+  message: string;
+}
+
+export type MergeResolution = 'a' | 'b';
+
+/** 合并会话：可中途保存，之后继续逐项确认 */
+export interface MergeSession {
+  id: string;
+  imageId: string;
+  baseVersion: number;
+  aVersion: number;
+  bVersion: number;
+  /** conflictId -> 选择哪一条修订 */
+  resolutions: Record<string, MergeResolution>;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface ImageRecord {
