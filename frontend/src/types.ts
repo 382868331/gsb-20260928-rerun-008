@@ -32,7 +32,46 @@ export interface ImageVersion {
   submittedAt: string | null;
   /** 返工来源版本号；为 null 表示首次提交 */
   basedOn: number | null;
+  /** 合并来源：两条修订的版本号（仅合并提交存在） */
+  mergeOf?: [number, number];
   note?: string;
+}
+
+export type MergeChoice = 'left' | 'right';
+
+export type MergeConflictKind =
+  | 'object-delete-vs-modify'
+  | 'category'
+  | 'contour-points'
+  | 'contour-delete-vs-modify'
+  | 'hole-points'
+  | 'hole-delete-vs-modify';
+
+export interface MergeConflict {
+  /** 稳定 id：同一对修订重复计算结果一致，用于保存/恢复确认状态 */
+  id: string;
+  objectId: string;
+  kind: MergeConflictKind;
+  contourId?: string;
+  holeId?: string;
+  message: string;
+  /** 争议内容的前后对照：基准值 / 左侧修订 / 右侧修订；删除侧为 null */
+  base: unknown;
+  left: unknown;
+  right: unknown;
+}
+
+export interface MergeSession {
+  id: string;
+  /** 共同基准版本号（两条修订的 basedOn） */
+  baseVersion: number;
+  leftVersion: number;
+  rightVersion: number;
+  conflicts: MergeConflict[];
+  /** 冲突 id -> 选择；撤回确认即移除对应键，不影响其他决定 */
+  resolutions: Record<string, MergeChoice>;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface ImageRecord {
@@ -43,6 +82,8 @@ export interface ImageRecord {
   /** 图片内容（dataURL）。导出文件中以 imageRef 引用 */
   dataUrl?: string;
   versions: ImageVersion[];
+  /** 进行中的合并会话；随记录持久化，中途保存后可继续处理 */
+  mergeSession?: MergeSession | null;
   createdAt: string;
 }
 

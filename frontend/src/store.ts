@@ -15,6 +15,14 @@ import {
 import { createImage } from './core/versioning';
 import type { LoadedImage } from './core/images';
 import { exportProject, importProject } from './core/exchange';
+import {
+  cancelMerge,
+  finalizeMerge,
+  resolveMergeConflict,
+  startMergeSession,
+  unresolveMergeConflict,
+} from './core/merge';
+import type { MergeChoice } from './types';
 import { uid } from './core/geometry';
 
 interface AppState {
@@ -34,8 +42,13 @@ interface AppState {
   removeContour: (objectId: string, contourId: string) => void;
   removeHole: (objectId: string, contourId: string, holeId: string) => void;
   submit: (note?: string) => void;
-  rework: (note?: string) => void;
+  rework: (note?: string, fromVersion?: number) => void;
   discard: () => void;
+  startMerge: (leftVersion: number, rightVersion: number) => void;
+  resolveMerge: (conflictId: string, choice: MergeChoice) => void;
+  unresolveMerge: (conflictId: string) => void;
+  cancelMergeSession: () => void;
+  finalizeMergeSession: (note?: string) => void;
   addCategory: (name: string, color: string) => void;
   exportJson: () => string;
   importJson: (raw: string) => ImportResult;
@@ -164,14 +177,45 @@ export const useStore = create<AppState>()(
           images: mutateImage(s.images, s.selectedImageId, (img) => submitDraft(img, note)),
         })),
 
-      rework: (note) =>
+      rework: (note, fromVersion) =>
         set((s) => ({
-          images: mutateImage(s.images, s.selectedImageId, (img) => startRework(img, note)),
+          images: mutateImage(s.images, s.selectedImageId, (img) => startRework(img, note, fromVersion)),
         })),
 
       discard: () =>
         set((s) => ({
           images: mutateImage(s.images, s.selectedImageId, (img) => discardDraft(img)),
+        })),
+
+      startMerge: (leftVersion, rightVersion) =>
+        set((s) => ({
+          images: mutateImage(s.images, s.selectedImageId, (img) =>
+            startMergeSession(img, leftVersion, rightVersion),
+          ),
+        })),
+
+      resolveMerge: (conflictId, choice) =>
+        set((s) => ({
+          images: mutateImage(s.images, s.selectedImageId, (img) =>
+            resolveMergeConflict(img, conflictId, choice),
+          ),
+        })),
+
+      unresolveMerge: (conflictId) =>
+        set((s) => ({
+          images: mutateImage(s.images, s.selectedImageId, (img) =>
+            unresolveMergeConflict(img, conflictId),
+          ),
+        })),
+
+      cancelMergeSession: () =>
+        set((s) => ({
+          images: mutateImage(s.images, s.selectedImageId, (img) => cancelMerge(img)),
+        })),
+
+      finalizeMergeSession: (note) =>
+        set((s) => ({
+          images: mutateImage(s.images, s.selectedImageId, (img) => finalizeMerge(img, note)),
         })),
 
       addCategory: (name, color) =>

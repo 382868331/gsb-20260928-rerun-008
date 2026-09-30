@@ -3,6 +3,7 @@ import { ImageList } from './components/ImageList';
 import { Canvas } from './components/Canvas';
 import { ObjectPanel } from './components/ObjectPanel';
 import { VersionBar } from './components/VersionBar';
+import { MergePanel } from './components/MergePanel';
 import { useStore } from './store';
 
 export default function App() {
@@ -20,6 +21,7 @@ export default function App() {
             </header>
             <Canvas image={image} />
             <VersionBar image={image} />
+            {image.mergeSession && <MergePanel image={image} />}
           </section>
         ) : (
           <section className="empty">

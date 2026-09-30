@@ -117,19 +117,22 @@ export function submitDraft(image: ImageRecord, note?: string): ImageRecord {
   return next;
 }
 
-// 对最近一次已提交版本发起返工：复制为新草稿，物体 id 全部保留，旧版本冻结
-export function startRework(image: ImageRecord, note?: string): ImageRecord {
+// 对指定（默认最近一次）已提交版本发起返工：复制为新草稿，物体 id 全部保留，旧版本冻结
+export function startRework(image: ImageRecord, note?: string, fromVersion?: number): ImageRecord {
   if (getDraft(image)) throw new Error(`图片 ${image.id} 已存在草稿，请先提交或丢弃`);
-  const latest = getLatestSubmitted(image);
-  if (!latest) throw new Error(`图片 ${image.id} 还没有已提交版本，无法返工`);
+  const base =
+    fromVersion === undefined
+      ? getLatestSubmitted(image)
+      : image.versions.find((v) => v.version === fromVersion && v.status === 'submitted');
+  if (!base) throw new Error(`图片 ${image.id} 没有可返工的已提交版本`);
   const next = clone(image);
   const draft: ImageVersion = {
     version: next.versions.length + 1,
     status: 'draft',
-    objects: clone(latest.objects),
+    objects: clone(base.objects),
     createdAt: nowIso(),
     submittedAt: null,
-    basedOn: latest.version,
+    basedOn: base.version,
     note,
   };
   next.versions.push(draft);
