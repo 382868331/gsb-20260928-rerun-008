@@ -6,11 +6,22 @@ export interface Contour {
   points: Point[];
   /** 孔洞（内轮廓），每个孔洞至少 3 个点；孔洞必须位于所属外轮廓内部 */
   holes: ContourHole[];
+  /** 区域血缘：该外轮廓来自哪个历史物体/轮廓 */
+  origin?: RegionOrigin;
 }
 
 export interface ContourHole {
   id: string;
   points: Point[];
+  /** 孔洞血缘；拆分/合并时孔洞仍然是孔洞，不会无声变成外轮廓 */
+  origin?: RegionOrigin;
+}
+
+export interface RegionOrigin {
+  version: number;
+  objectId: string;
+  contourId: string;
+  holeId?: string;
 }
 
 export interface AnnotationObject {
@@ -20,6 +31,8 @@ export interface AnnotationObject {
   contours: Contour[];
   createdAt: string;
   updatedAt: string;
+  /** 该对象由哪些旧对象/区域而来；普通对象也保留自身来源 */
+  origins?: RegionOrigin[];
 }
 
 export type VersionStatus = 'draft' | 'submitted';
@@ -34,6 +47,10 @@ export interface ImageVersion {
   basedOn: number | null;
   /** 合并来源：本次提交由 base 版本的两条修订（a、b）合并而来 */
   mergeOf?: MergeSources;
+  /** 本次返工业已确认的拆分/合并拓扑关系 */
+  objectTransforms?: ObjectTransform[];
+  /** 合并裁决审计：每个最终区域的来源和人工选择 */
+  mergeAudit?: MergeAudit;
   note?: string;
 }
 
@@ -43,7 +60,30 @@ export interface MergeSources {
   b: number;
 }
 
+export type ObjectTransformKind = 'split' | 'merge';
+
+/** 一次返工中的对象拓扑变更：一个拆多个，或多个合一个 */
+export interface ObjectTransform {
+  id: string;
+  kind: ObjectTransformKind;
+  sourceObjectIds: string[];
+  targetObjectIds: string[];
+  /** source -> target 的轮廓/孔洞级血缘，禁止只凭新对象 id 断开身份 */
+  mappings: ObjectTransformMapping[];
+  createdAt: string;
+}
+
+export interface ObjectTransformMapping {
+  sourceObjectId: string;
+  sourceContourId: string;
+  targetObjectId: string;
+  targetContourId: string;
+  holes: Array<{ sourceHoleId: string; targetHoleId: string }>;
+}
+
 export type MergePartKind =
+  | 'split-relation'
+  | 'merge-relation'
   | 'object-existence'
   | 'category'
   | 'outline'
@@ -59,6 +99,10 @@ export interface MergeConflict {
   part: MergePartKind;
   contourId?: string;
   holeId?: string;
+  /** 必须先确认的拆合关系 id */
+  relationId?: string;
+  sourceObjectIds?: string[];
+  targetObjectIds?: string[];
   /** 基线版本中的值（删除类冲突时可能为 undefined 表示不存在） */
   baseValue: unknown;
   aValue: unknown;
@@ -66,7 +110,7 @@ export interface MergeConflict {
   message: string;
 }
 
-export type MergeResolution = 'a' | 'b';
+export type MergeResolution = 'a' | 'b' | 'discard' | 'disputed';
 
 /** 合并会话：可中途保存，之后继续逐项确认 */
 export interface MergeSession {
@@ -77,8 +121,16 @@ export interface MergeSession {
   bVersion: number;
   /** conflictId -> 选择哪一条修订 */
   resolutions: Record<string, MergeResolution>;
+  /** relationId -> 采用哪一边的拓扑；不存在表示继续保留争议 */
+  relations: Record<string, 'a' | 'b' | 'discard' | 'disputed'>;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface MergeAudit {
+  sessionId: string;
+  relationChoices: Array<{ id: string; choice: 'a' | 'b'; at: string }>;
+  decisions: Array<{ conflictId: string; choice: Exclude<MergeResolution, 'disputed'>; at: string }>;
 }
 
 export interface ImageRecord {

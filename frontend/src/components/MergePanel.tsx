@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { GitMerge, Undo2, X } from 'lucide-react';
 import { useStore } from '../store';
-import { planMerge } from '../core/merge';
+import { planMergeWithRelations } from '../core/merge';
 import type { Category, ImageRecord, MergeConflict } from '../types';
 
 function isPoints(v: unknown): v is { x: number; y: number }[] {
@@ -51,9 +51,9 @@ function ConflictRow({
   onUndo,
 }: {
   conflict: MergeConflict;
-  choice: 'a' | 'b' | undefined;
+  choice: string | undefined;
   categories: Category[];
-  onPick: (c: 'a' | 'b') => void;
+  onPick: (c: 'a' | 'b' | 'discard' | 'disputed') => void;
   onUndo: () => void;
 }) {
   return (
@@ -80,6 +80,8 @@ function ConflictRow({
         <button className="primary" disabled={choice === 'b'} onClick={() => onPick('b')}>
           采用 B
         </button>
+        <button disabled={choice === 'discard'} onClick={() => onPick('discard')}>舍弃双方修改</button>
+        <button disabled={choice === 'disputed'} onClick={() => onPick('disputed')}>保留争议</button>
         {choice && (
           <button onClick={onUndo} title="撤回该项确认，不影响其他决定">
             <Undo2 size={13} /> 撤回
@@ -90,12 +92,44 @@ function ConflictRow({
   );
 }
 
+function RelationRow({
+  conflict,
+  choice,
+  onPick,
+  onUndo,
+}: {
+  conflict: MergeConflict;
+  choice: string | undefined;
+  onPick: (c: 'a' | 'b' | 'discard' | 'disputed') => void;
+  onUndo: () => void;
+}) {
+  return (
+    <li className={'conflict relation' + (choice ? ' resolved' : '')}>
+      <p className="conflict-msg">{conflict.message}</p>
+      <p className="muted">
+        旧对象 {(conflict.sourceObjectIds ?? []).map((id) => id.slice(-6)).join('、')}；
+        新对象 {(conflict.targetObjectIds ?? []).map((id) => id.slice(-6)).join('、')}。
+        先确认关系后，类别、外轮廓和孔洞冲突会按对应部分展开。
+      </p>
+      <div className="conflict-actions">
+        <button className="primary" disabled={choice === 'a'} onClick={() => onPick('a')}>采用 A 拆合</button>
+        <button className="primary" disabled={choice === 'b'} onClick={() => onPick('b')}>采用 B 拆合</button>
+        <button disabled={choice === 'discard'} onClick={() => onPick('discard')}>舍弃拆合</button>
+        <button disabled={choice === 'disputed'} onClick={() => onPick('disputed')}>保留争议</button>
+        {choice && <button onClick={onUndo}><Undo2 size={13} /> 撤回关系</button>}
+      </div>
+    </li>
+  );
+ }
+
 export function MergePanel({ image }: { image: ImageRecord }) {
   const categories = useStore((s) => s.categories);
   const session = useStore((s) => s.mergeSessions.find((m) => m.imageId === image.id));
   const startMerge = useStore((s) => s.startMerge);
   const resolveConflict = useStore((s) => s.resolveConflict);
+  const resolveRelation = useStore((s) => s.resolveRelation);
   const unresolveConflict = useStore((s) => s.unresolveConflict);
+  const unresolveRelation = useStore((s) => s.unresolveRelation);
   const cancelMerge = useStore((s) => s.cancelMerge);
   const completeMerge = useStore((s) => s.completeMerge);
   const submitted = image.versions.filter((v) => v.status === 'submitted');
@@ -106,7 +140,7 @@ export function MergePanel({ image }: { image: ImageRecord }) {
   const conflicts = useMemo(() => {
     if (!session) return [];
     try {
-      return planMerge(image, session.aVersion, session.bVersion).conflicts;
+      return planMergeWithRelations(image, session.aVersion, session.bVersion, session.relations).conflicts;
     } catch {
       return [];
     }
@@ -167,8 +201,13 @@ export function MergePanel({ image }: { image: ImageRecord }) {
     );
   }
 
-  const done = conflicts.filter((c) => session.resolutions[c.id]).length;
-  const allDone = conflicts.length === done;
+  const isRelation = (c: MergeConflict) => c.part === 'split-relation' || c.part === 'merge-relation';
+  const relationDone = conflicts.filter(isRelation).every((c) => session.relations[c.id] && session.relations[c.id] !== 'disputed');
+  const decisionDone = conflicts.filter((c) => !isRelation(c)).every((c) => session.resolutions[c.id] && session.resolutions[c.id] !== 'disputed');
+  const allDone = conflicts.length > 0 && relationDone && decisionDone;
+  const done = conflicts.filter((c) => isRelation(c)
+    ? session.relations[c.id] && session.relations[c.id] !== 'disputed'
+    : session.resolutions[c.id] && session.resolutions[c.id] !== 'disputed').length;
   return (
     <div className="merge-panel">
       <h3>
@@ -181,7 +220,15 @@ export function MergePanel({ image }: { image: ImageRecord }) {
       </p>
       {conflicts.length > 0 && (
         <ul className="conflict-list">
-          {conflicts.map((c) => (
+          {conflicts.map((c) => isRelation(c) ? (
+            <RelationRow
+              key={c.id}
+              conflict={c}
+              choice={session.relations[c.id]}
+              onPick={(choice) => resolveRelation(c.id, choice)}
+              onUndo={() => unresolveRelation(c.id)}
+            />
+          ) : (
             <ConflictRow
               key={c.id}
               conflict={c}

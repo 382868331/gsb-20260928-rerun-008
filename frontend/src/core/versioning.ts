@@ -5,7 +5,10 @@ import type {
   ContourHole,
   ImageRecord,
   ImageVersion,
+  ObjectTransform,
+  ObjectTransformMapping,
   Point,
+  RegionOrigin,
 } from '../types';
 import { uid } from './geometry';
 
@@ -102,6 +105,159 @@ export function removeDraftObject(image: ImageRecord, objectId: string): ImageRe
   const draft = getDraft(next);
   if (!draft) throw new Error('当前没有可编辑的草稿');
   draft.objects = draft.objects.filter((o) => o.id !== objectId);
+  return next;
+}
+
+function stampContourOrigin(
+  contour: Contour,
+  sourceVersion: number,
+  objectId: string,
+): Contour {
+  const origin: RegionOrigin = contour.origin ?? {
+    version: sourceVersion,
+    objectId,
+    contourId: contour.id,
+  };
+  return {
+    ...contour,
+    origin,
+    holes: contour.holes.map((hole) => ({
+      ...hole,
+      origin: hole.origin ?? { ...origin, holeId: hole.id },
+    })),
+  };
+}
+
+function stampObjectOrigins(obj: AnnotationObject, sourceVersion: number): AnnotationObject {
+  return {
+    ...obj,
+    origins: obj.origins ?? obj.contours.map((c) => c.origin ?? {
+      version: sourceVersion,
+      objectId: obj.id,
+      contourId: c.id,
+    }),
+    contours: obj.contours.map((c) => stampContourOrigin(c, sourceVersion, obj.id)),
+  };
+}
+
+function getReworkDraft(image: ImageRecord): ImageVersion {
+  const draft = getDraft(image);
+  if (!draft) throw new Error(`图片 ${image.id} 没有可编辑的草稿，请先发起返工`);
+  if (draft.basedOn == null) throw new Error('只能在基于已提交版本的返工中拆分或合并对象');
+  return draft;
+}
+
+function mappingsForContour(
+  sourceObjectId: string,
+  targetObjectId: string,
+  contour: Contour,
+): ObjectTransformMapping {
+  return {
+    sourceObjectId,
+    sourceContourId: contour.origin?.contourId ?? contour.id,
+    targetObjectId,
+    targetContourId: contour.id,
+    holes: contour.holes.map((hole) => ({
+      sourceHoleId: hole.origin?.holeId ?? hole.id,
+      targetHoleId: hole.id,
+    })),
+  };
+}
+
+function assertUniqueMappings(transforms: ObjectTransform[]): void {
+  const seen = new Set<string>();
+  for (const transform of transforms) {
+    for (const mapping of transform.mappings) {
+      if (seen.has(mapping.sourceObjectId + ':' + mapping.sourceContourId)) {
+        throw new Error('同一区域被重复拆合，不能重复导出重叠部分');
+      }
+      seen.add(mapping.sourceObjectId + ':' + mapping.sourceContourId);
+      for (const h of mapping.holes) {
+        const holeKey = mapping.sourceObjectId + ':' + mapping.sourceContourId + ':' + h.sourceHoleId;
+        if (seen.has(holeKey)) throw new Error('同一孔洞被重复拆合，不能重复导出');
+        seen.add(holeKey);
+      }
+    }
+  }
+}
+
+/** 把一个对象的外轮廓分组拆开；第一组保留原对象，其余组生成新对象 */
+export function splitDraftObjectContours(
+  image: ImageRecord,
+  objectId: string,
+  contourGroups: string[][],
+): ImageRecord {
+  const next = clone(image);
+  const draft = getReworkDraft(next);
+  const source = draft.objects.find((o) => o.id === objectId);
+  if (!source) throw new Error(`物体 ${objectId} 不存在，无法拆分`);
+  if (contourGroups.length < 2) throw new Error('拆分至少需要两个轮廓分组');
+  const groups = contourGroups.map((g) => [...new Set(g)]);
+  const all = groups.flat();
+  if (all.length !== new Set(all).size) throw new Error('拆分分组不能重复使用同一个轮廓');
+  const available = new Set(source.contours.map((c) => c.id));
+  if (!all.every((id) => available.has(id)) || all.length !== available.size) {
+    throw new Error('拆分必须完整且不重叠地分配对象的所有外轮廓');
+  }
+
+  const baseVersion = draft.basedOn!;
+  const mappings: ObjectTransformMapping[] = [];
+  const targetIds: string[] = [];
+  const oldContours = new Map(source.contours.map((c) => [c.id, c]));
+  source.contours = groups[0].map((id) => stampContourOrigin(oldContours.get(id)!, baseVersion, objectId));
+  source.origins = source.contours.map((c) => c.origin!);
+  source.updatedAt = nowIso();
+  targetIds.push(source.id);
+  source.contours.forEach((c) => mappings.push(mappingsForContour(objectId, source.id, c)));
+
+  groups.slice(1).forEach((group) => {
+    const created = stampObjectOrigins(createObject(source.categoryId), baseVersion);
+    created.contours = group.map((id) => stampContourOrigin(oldContours.get(id)!, baseVersion, objectId));
+    created.origins = created.contours.map((c) => c.origin!);
+    draft.objects.push(created);
+    targetIds.push(created.id);
+    created.contours.forEach((c) => mappings.push(mappingsForContour(objectId, created.id, c)));
+  });
+
+  draft.objectTransforms = [...(draft.objectTransforms ?? []), {
+    id: uid('split'), kind: 'split', sourceObjectIds: [objectId], targetObjectIds: targetIds,
+    mappings, createdAt: nowIso(),
+  }];
+  assertUniqueMappings(draft.objectTransforms);
+  return next;
+}
+
+/** 多个对象合并为第一个对象；轮廓和孔洞整体迁移，孔洞仍挂在原外轮廓下 */
+export function mergeDraftObjects(image: ImageRecord, objectIds: string[]): ImageRecord {
+  const next = clone(image);
+  const draft = getReworkDraft(next);
+  const ids = [...new Set(objectIds)];
+  if (ids.length < 2) throw new Error('合并至少需要两个对象');
+  const sources = ids.map((id) => draft.objects.find((o) => o.id === id));
+  if (sources.some((o) => !o)) throw new Error('参与合并的对象不存在');
+  const [, ...rest] = sources;
+  const existingTransform = (draft.objectTransforms ?? []).flatMap((t) => t.mappings).find((m) =>
+    ids.includes(m.sourceObjectId) || ids.includes(m.targetObjectId));
+  if (existingTransform) throw new Error('参与对象已经拆合过，不能重复导出同一区域');
+  const targetObject = sources[0]!;
+  const baseVersion = draft.basedOn!;
+  const mappings: ObjectTransformMapping[] = [];
+  for (const source of sources) {
+    source!.contours = source!.contours.map((c) => stampContourOrigin(c, baseVersion, source!.id));
+    source!.contours.forEach((c) => mappings.push(mappingsForContour(source!.id, targetObject.id, c)));
+  }
+  for (const source of rest) {
+    targetObject.contours.push(...source!.contours);
+    targetObject.origins?.push(...(source!.origins ?? source!.contours.map((c) => c.origin!)));
+  }
+  targetObject.origins = sources.flatMap((s) => s!.origins ?? s!.contours.map((c) => c.origin!));
+  targetObject.updatedAt = nowIso();
+  draft.objects = draft.objects.filter((o) => !ids.slice(1).includes(o.id));
+  draft.objectTransforms = [...(draft.objectTransforms ?? []), {
+    id: uid('merge'), kind: 'merge', sourceObjectIds: ids, targetObjectIds: [targetObject.id],
+    mappings, createdAt: nowIso(),
+  }];
+  assertUniqueMappings(draft.objectTransforms);
   return next;
 }
 

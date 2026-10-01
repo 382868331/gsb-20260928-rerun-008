@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Plus, Trash2, CircleDot, Grid3x3 } from 'lucide-react';
+import { Plus, Trash2, CircleDot, Grid3x3, Scissors, Combine } from 'lucide-react';
 import { useStore } from '../store';
 import { getDraft } from '../core/versioning';
 import type { ImageRecord } from '../types';
@@ -12,10 +12,24 @@ export function ObjectPanel({ image }: { image: ImageRecord }) {
   const setObjectCategory = useStore((s) => s.setObjectCategory);
   const removeContour = useStore((s) => s.removeContour);
   const removeHole = useStore((s) => s.removeHole);
+  const splitObject = useStore((s) => s.splitObject);
+  const mergeObjects = useStore((s) => s.mergeObjects);
   const [newCat, setNewCat] = useState('');
+  const [splitSelection, setSplitSelection] = useState<Record<string, string[]>>({});
+  const [mergeSelection, setMergeSelection] = useState<string[]>([]);
 
   const draft = getDraft(image);
   const colorOf = (id: string) => categories.find((c) => c.id === id)?.color ?? '#999';
+  const toggleContour = (objectId: string, contourId: string) =>
+    setSplitSelection((s) => {
+      const current = s[objectId] ?? [];
+      return {
+        ...s,
+        [objectId]: current.includes(contourId)
+          ? current.filter((id) => id !== contourId)
+          : [...current, contourId],
+      };
+    });
 
   return (
     <div className="object-panel">
@@ -44,10 +58,24 @@ export function ObjectPanel({ image }: { image: ImageRecord }) {
             </button>
           </header>
           <div className="id-line" title="物体身份标识，跨版本保持不变">id: {obj.id}</div>
+          {obj.origins && (
+            <div className="id-line" title="区域血缘">
+              来源：{obj.origins.map((o) => `v${o.version}:${o.objectId.slice(-6)}/${o.contourId.slice(-6)}`).join('，')}
+            </div>
+          )}
           {obj.contours.map((c) => (
             <div key={c.id} className="contour-row">
               <CircleDot size={13} />
               <span>外轮廓（{c.points.length} 点）</span>
+              {draft.basedOn != null && obj.contours.length > 1 && (
+                <label className="mini-check">
+                  <input
+                    type="checkbox"
+                    checked={(splitSelection[obj.id] ?? []).includes(c.id)}
+                    onChange={() => toggleContour(obj.id, c.id)}
+                  /> 拆出
+                </label>
+              )}
               <button className="icon-btn danger" onClick={() => removeContour(obj.id, c.id)}>
                 <Trash2 size={12} />
               </button>
@@ -62,12 +90,56 @@ export function ObjectPanel({ image }: { image: ImageRecord }) {
               ))}
             </div>
           ))}
+          {draft.basedOn != null && (splitSelection[obj.id]?.length ?? 0) > 0 &&
+            (splitSelection[obj.id]?.length ?? 0) < obj.contours.length && (
+            <button
+              className="mini-btn"
+              onClick={() => {
+                const picked = splitSelection[obj.id]!;
+                splitObject(obj.id, [
+                  obj.contours.map((c) => c.id).filter((id) => !picked.includes(id)),
+                  picked,
+                ]);
+                setSplitSelection((s) => ({ ...s, [obj.id]: [] }));
+              }}
+            >
+              <Scissors size={12} /> 按勾选拆出新对象
+            </button>
+          )}
         </div>
       ))}
       {draft && (
         <button className="block-btn" onClick={() => addObject(categories[0]?.id ?? '')} disabled={!categories.length}>
           <Plus size={15} /> 新增物体
         </button>
+      )}
+
+      {draft?.basedOn != null && (
+        <div className="merge-objects">
+          <h4>合并对象</h4>
+          {draft.objects.map((obj) => (
+            <label key={obj.id} className="mini-check">
+              <input
+                type="checkbox"
+                checked={mergeSelection.includes(obj.id)}
+                onChange={(e) =>
+                  setMergeSelection((s) => e.target.checked ? [...s, obj.id] : s.filter((id) => id !== obj.id))
+                }
+              />
+              {obj.id.slice(-6)}（{obj.contours.length} 轮廓）
+            </label>
+          ))}
+          <button
+            className="mini-btn"
+            disabled={mergeSelection.length < 2}
+            onClick={() => {
+              mergeObjects(mergeSelection);
+              setMergeSelection([]);
+            }}
+          >
+            <Combine size={12} /> 合并勾选对象
+          </button>
+        </div>
       )}
 
       <h4>类别管理</h4>

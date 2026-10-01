@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { planMergeWithRelations } from './merge';
 import {
   applyMergeSession,
   createMergeSession,
@@ -36,6 +37,11 @@ function baseImage(): { img: ImageRecord; obj1: string; obj2: string } {
   img = updateDraftObject(r2.image, r2.objectId, (o) => {
     o.contours.push(createContour([
       { x: 110, y: 110 }, { x: 190, y: 110 }, { x: 190, y: 190 }, { x: 110, y: 190 },
+    ]));
+  });
+  img = updateDraftObject(img, r1.objectId, (o) => {
+    o.contours.push(createContour([
+      { x: 110, y: 10 }, { x: 180, y: 10 }, { x: 180, y: 80 }, { x: 110, y: 80 },
     ]));
   });
   img = submitDraft(img, 'base');
@@ -181,5 +187,125 @@ describe('merge', () => {
     const v = merged(img, session);
     expect(v.objects.find((o) => o.id === obj1)!.contours[0].holes).toHaveLength(2);
     expect(v.objects.find((o) => o.id === obj2)!.contours[0].points[1]).toEqual({ x: 185, y: 110 });
+  });
+
+  it('tracks split sources, maps category/hole edits to parts, and undo reopens only dependencies', () => {
+    const { img: base, obj1, obj2 } = baseImage();
+    const source = base.versions[0].objects.find((o) => o.id === obj1)!;
+    const c0 = source.contours[0].id;
+    const h0 = source.contours[0].holes[0].id;
+    const c1 = source.contours[1].id;
+    const newId = 'obj_split_part';
+
+    let img = revise(base, 1, (objs) => {
+      const old = objs.find((o) => o.id === obj1)!;
+      const moved = old.contours.splice(1, 1)[0];
+      moved.origin = { version: 1, objectId: obj1, contourId: c1 };
+      old.contours[0].origin = { version: 1, objectId: obj1, contourId: c0 };
+      old.origins = [old.contours[0].origin];
+      objs.push({
+        ...old,
+        id: newId,
+        contours: [moved],
+        origins: [moved.origin],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      objs.find((o) => o.id === obj2)!.categoryId = cats[2].id;
+    });
+    const splitVersion = img.versions.at(-1)!;
+    splitVersion.objectTransforms = [{
+      id: 'split-test', kind: 'split', sourceObjectIds: [obj1], targetObjectIds: [obj1, newId],
+      mappings: [
+        { sourceObjectId: obj1, sourceContourId: c0, targetObjectId: obj1, targetContourId: c0, holes: [{ sourceHoleId: h0, targetHoleId: h0 }] },
+        { sourceObjectId: obj1, sourceContourId: c1, targetObjectId: newId, targetContourId: c1, holes: [] },
+      ],
+      createdAt: new Date().toISOString(),
+    }];
+
+    img = revise(img, 1, (objs) => {
+      const old = objs.find((o) => o.id === obj1)!;
+      old.categoryId = cats[1].id;
+      old.contours[0].holes[0].points[0] = { x: 34, y: 34 };
+      objs.find((o) => o.id === obj2)!.categoryId = cats[0].id;
+    });
+
+    const session = createMergeSession(img, 2, 3);
+    let plan = planMerge(img, 2, 3);
+    expect(plan.conflicts.map((c) => c.part)).toEqual(['split-relation']);
+    const relationId = plan.conflicts[0].id;
+    expect(() => applyMergeSession(img, session)).toThrow(/未确认/);
+
+    session.relations[relationId] = 'a';
+    plan = planMergeWithRelations(img, 2, 3, session.relations);
+    expect(plan.conflicts.filter((c) => c.relationId === relationId).map((c) => c.objectId).sort()).toEqual([newId, obj1, obj1].sort());
+    expect(plan.conflicts.some((c) => c.part === 'hole' && c.objectId === obj1 && c.holeId === h0)).toBe(true);
+    expect(plan.conflicts.some((c) => c.part === 'category' && c.objectId === newId)).toBe(true);
+    expect(plan.conflicts.some((c) => c.objectId === obj2)).toBe(true);
+
+    for (const conflict of plan.conflicts) {
+      session.resolutions[conflict.id] = conflict.part === 'hole' ? 'b' : 'a';
+    }
+    expect(() => applyMergeSession(img, session)).not.toThrow();
+    delete session.relations[relationId];
+    session.resolutions = {};
+    session.relations[relationId] = 'a';
+    for (const conflict of planMergeWithRelations(img, 2, 3, session.relations).conflicts) session.resolutions[conflict.id] = 'a';
+    expect(session.resolutions['category:' + obj2]).toBeDefined();
+    const dependentIds = planMergeWithRelations(img, 2, 3, session.relations).conflicts
+      .filter((c) => c.relationId === relationId)
+      .map((c) => c.id);
+    delete session.relations[relationId];
+    session.resolutions = Object.fromEntries(Object.entries(session.resolutions).filter(([id]) => !dependentIds.includes(id)));
+    expect(session.resolutions['category:' + obj1]).toBeUndefined();
+    expect(session.resolutions['category:' + newId]).toBeUndefined();
+    expect(session.resolutions['category:' + obj2]).toBe('a');
+
+    session.relations[relationId] = 'a';
+    for (const conflict of planMergeWithRelations(img, 2, 3, session.relations).conflicts.filter((c) => !session.resolutions[c.id])) {
+      session.resolutions[conflict.id] = conflict.part === 'hole' ? 'b' : 'a';
+    }
+    const v = merged(img, session);
+    const parts = v.objects.filter((o) => o.id === obj1 || o.id === newId);
+    expect(parts).toHaveLength(2);
+    expect(parts.flatMap((o) => o.origins ?? []).map((o) => o.contourId).sort()).toEqual([c0, c1]);
+    expect(parts.find((o) => o.id === obj1)!.contours[0].holes).toHaveLength(1);
+    expect(parts.find((o) => o.id === obj1)!.contours[0].holes[0].points[0]).toEqual({ x: 34, y: 34 });
+    expect(v.mergeAudit?.relationChoices[0].id).toBe(relationId);
+  });
+
+  it('tracks merged object sources and keeps holes attached to their original outlines', () => {
+    const { img: base, obj1, obj2 } = baseImage();
+    const c1 = base.versions[0].objects.find((o) => o.id === obj1)!.contours[0].id;
+    const c2 = base.versions[0].objects.find((o) => o.id === obj2)!.contours[0].id;
+    const h1 = base.versions[0].objects.find((o) => o.id === obj1)!.contours[0].holes[0].id;
+    let img = revise(base, 1, (objs) => {
+      const first = objs.find((o) => o.id === obj1)!;
+      const second = objs.splice(objs.findIndex((o) => o.id === obj2), 1)[0];
+      first.contours.push(...second.contours);
+      first.origins = first.contours.map((c) => ({ version: 1, objectId: c === first.contours[0] ? obj1 : obj2, contourId: c.id }));
+    });
+    img.versions.at(-1)!.objectTransforms = [{
+      id: 'merge-test', kind: 'merge', sourceObjectIds: [obj1, obj2], targetObjectIds: [obj1],
+      mappings: [
+        { sourceObjectId: obj1, sourceContourId: c1, targetObjectId: obj1, targetContourId: c1, holes: [{ sourceHoleId: h1, targetHoleId: h1 }] },
+        { sourceObjectId: obj2, sourceContourId: c2, targetObjectId: obj1, targetContourId: c2, holes: [] },
+      ],
+      createdAt: new Date().toISOString(),
+    }];
+    img = revise(img, 1, (objs) => {
+      objs.find((o) => o.id === obj1)!.contours[0].holes[0].points[0] = { x: 36, y: 36 };
+      objs.find((o) => o.id === obj2)!.contours[0].points[1] = { x: 188, y: 110 };
+    });
+    const session = createMergeSession(img, 2, 3);
+    const relationId = planMerge(img, 2, 3).conflicts[0].id;
+    session.relations[relationId] = 'a';
+    const v = merged(img, session);
+    const mergedObj = v.objects.find((o) => o.id === obj1)!;
+    expect(v.objects.some((o) => o.id === obj2)).toBe(false);
+    expect(mergedObj.contours.map((c) => c.origin?.objectId)).toEqual([obj1, obj2]);
+    expect(mergedObj.contours[0].holes).toHaveLength(1);
+    expect(mergedObj.contours[0].holes[0].origin).toMatchObject({ objectId: obj1, contourId: c1, holeId: h1 });
+    expect(mergedObj.contours[1].points[1]).toEqual({ x: 188, y: 110 });
   });
 });

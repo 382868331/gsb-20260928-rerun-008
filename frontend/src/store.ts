@@ -7,7 +7,9 @@ import {
   createHole,
   defaultCategories,
   discardDraft,
+  mergeDraftObjects,
   removeDraftObject,
+  splitDraftObjectContours,
   startRework,
   submitDraft,
   updateDraftObject,
@@ -15,7 +17,7 @@ import {
 import { createImage } from './core/versioning';
 import type { LoadedImage } from './core/images';
 import { exportProject, importProject } from './core/exchange';
-import { applyMergeSession, createMergeSession } from './core/merge';
+import { applyMergeSession, createMergeSession, planMergeWithRelations } from './core/merge';
 import { uid } from './core/geometry';
 import { nowIso } from './core/versioning';
 
@@ -36,6 +38,8 @@ interface AppState {
   updateHolePoints: (objectId: string, contourId: string, holeId: string, points: Point[]) => void;
   removeContour: (objectId: string, contourId: string) => void;
   removeHole: (objectId: string, contourId: string, holeId: string) => void;
+  splitObject: (objectId: string, contourGroups: string[][]) => void;
+  mergeObjects: (objectIds: string[]) => void;
   submit: (note?: string) => void;
   rework: (note?: string) => void;
   discard: () => void;
@@ -45,6 +49,8 @@ interface AppState {
   resetAll: () => void;
   startMerge: (aVersion: number, bVersion: number) => MergeSession;
   resolveConflict: (conflictId: string, choice: MergeResolution) => void;
+  resolveRelation: (relationId: string, choice: MergeSession['relations'][string]) => void;
+  unresolveRelation: (relationId: string) => void;
   unresolveConflict: (conflictId: string) => void;
   cancelMerge: () => void;
   completeMerge: (note?: string) => void;
@@ -168,6 +174,17 @@ export const useStore = create<AppState>()(
           ),
         })),
 
+      splitObject: (objectId, contourGroups) =>
+        set((s) => ({
+          images: mutateImage(s.images, s.selectedImageId, (img) =>
+            splitDraftObjectContours(img, objectId, contourGroups)),
+        })),
+
+      mergeObjects: (objectIds) =>
+        set((s) => ({
+          images: mutateImage(s.images, s.selectedImageId, (img) => mergeDraftObjects(img, objectIds)),
+        })),
+
       submit: (note) =>
         set((s) => ({
           images: mutateImage(s.images, s.selectedImageId, (img) => submitDraft(img, note)),
@@ -229,6 +246,51 @@ export const useStore = create<AppState>()(
             return { ...m, resolutions, updatedAt: nowIso() };
           }),
         })),
+
+      resolveRelation: (relationId, choice) => set((s) => {
+        const image = s.images.find((i) => i.id === s.selectedImageId);
+        const session = s.mergeSessions.find((m) => m.id === (s.mergeSessions.find((x) => x.imageId === s.selectedImageId)?.id));
+        const nextRelations = session ? { ...session.relations, [relationId]: choice } : {};
+        const dependent = new Set<string>();
+        if (image && session) {
+          planMergeWithRelations(image, session.aVersion, session.bVersion, nextRelations).conflicts
+            .filter((c) => c.relationId === relationId)
+            .forEach((c) => dependent.add(c.id));
+        }
+        return {
+          mergeSessions: s.mergeSessions.map((m) => m.imageId === s.selectedImageId && session && m.id === session.id
+            ? {
+                ...m,
+                relations: nextRelations,
+                resolutions: Object.fromEntries(Object.entries(m.resolutions).filter(([id]) => !dependent.has(id))),
+                updatedAt: nowIso(),
+              }
+            : m),
+        };
+      }),
+
+      unresolveRelation: (relationId) => set((s) => {
+        const image = s.images.find((i) => i.id === s.selectedImageId);
+        const session = s.mergeSessions.find((m) => m.imageId === s.selectedImageId);
+        if (!image || !session) return {};
+        const dependent = new Set(
+          planMergeWithRelations(image, session.aVersion, session.bVersion, session.relations).conflicts
+            .filter((c) => c.relationId === relationId)
+            .map((c) => c.id),
+        );
+        const relations = { ...session.relations };
+        delete relations[relationId];
+        return {
+          mergeSessions: s.mergeSessions.map((m) => m.id === session.id
+            ? {
+                ...m,
+                relations,
+                resolutions: Object.fromEntries(Object.entries(m.resolutions).filter(([id]) => !dependent.has(id))),
+                updatedAt: nowIso(),
+              }
+            : m),
+        };
+      }),
 
       cancelMerge: () =>
         set((s) => ({ mergeSessions: s.mergeSessions.filter((m) => m.imageId !== s.selectedImageId) })),

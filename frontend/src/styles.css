@@ -170,3 +170,17 @@ svg.drawing { cursor: crosshair; }
 .val.deleted { color: #f87171; }
 .conflict-actions, .merge-actions { display: flex; gap: 8px; align-items: center; }
 .merge-actions { margin-top: 8px; }
+.conflict.relation { background: #172033; }
+.conflict-actions button {
+  background: #334155; color: #e2e8f0; border: 1px solid #475569; border-radius: 6px;
+  padding: 4px 8px; cursor: pointer; font-size: 12px;
+}
+.conflict-actions button.primary, .merge-actions .primary { background: #2563eb; border-color: #2563eb; }
+.conflict-actions button:disabled, .merge-actions button:disabled { opacity: .45; cursor: not-allowed; }
+.mini-check { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: #cbd5e1; }
+.mini-btn {
+  display: inline-flex; align-items: center; gap: 4px; margin: 4px 0;
+  background: #334155; color: #e2e8f0; border: 1px solid #475569; border-radius: 6px;
+  padding: 3px 7px; cursor: pointer; font-size: 11px;
+}
+.merge-objects { border-top: 1px solid #2a2f3a; margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
