@@ -2,15 +2,29 @@ export type Point = { x: number; y: number };
 
 export interface Contour {
   id: string;
-  /** 外轮廓顶点，按顺时针/逆时针顺序均可，至少 3 个点 */
   points: Point[];
-  /** 孔洞（内轮廓），每个孔洞至少 3 个点；孔洞必须位于所属外轮廓内部 */
   holes: ContourHole[];
+  /** 来源外轮廓 id；由孔洞经人工确认转为外轮廓时同时记录 sourceHoleId */
+  sourceContourId?: string;
+  sourceHoleId?: string;
 }
 
 export interface ContourHole {
   id: string;
   points: Point[];
+  /** 来源孔洞 id，用于拆分/合并后继续追溯 */
+  sourceHoleId?: string;
+}
+
+export interface RegionSource {
+  objectId: string;
+  contourId?: string;
+  holeId?: string;
+}
+
+export interface ObjectProvenance {
+  sources: RegionSource[];
+  transformation: 'identity' | 'split' | 'merge' | 'new';
 }
 
 export interface AnnotationObject {
@@ -20,6 +34,8 @@ export interface AnnotationObject {
   contours: Contour[];
   createdAt: string;
   updatedAt: string;
+  /** 合并后对象来自哪些旧对象/区域；原始修订中的对象通常不带该字段 */
+  provenance?: ObjectProvenance;
 }
 
 export type VersionStatus = 'draft' | 'submitted';
@@ -34,6 +50,8 @@ export interface ImageVersion {
   basedOn: number | null;
   /** 合并来源：本次提交由 base 版本的两条修订（a、b）合并而来 */
   mergeOf?: MergeSources;
+  /** 合并过程中每项关系与片段修改的人工选择 */
+  mergeAudit?: MergeAudit;
   note?: string;
 }
 
@@ -43,13 +61,32 @@ export interface MergeSources {
   b: number;
 }
 
+export type MergeRelationKind = 'split' | 'merge' | 'hole-to-outline' | 'overlap';
+
+export interface MergeRelation {
+  id: string;
+  kind: MergeRelationKind;
+  side: 'a' | 'b';
+  targetObjectIds: string[];
+  sourceObjectIds: string[];
+  sourceContourIds?: string[];
+  sourceHoleIds?: string[];
+  message: string;
+}
+
+export type MergeRelationDecision = 'confirmed' | 'rejected' | 'disputed';
+
 export type MergePartKind =
   | 'object-existence'
   | 'category'
   | 'outline'
   | 'contour-existence'
   | 'hole'
-  | 'hole-existence';
+  | 'hole-existence'
+  | 'split-relation'
+  | 'merge-relation'
+  | 'hole-promotion'
+  | 'duplicate-region';
 
 /** 一处需要用户裁决的冲突：同一物体同一部分被两条修订改成了不同结果 */
 export interface MergeConflict {
@@ -59,6 +96,10 @@ export interface MergeConflict {
   part: MergePartKind;
   contourId?: string;
   holeId?: string;
+  /** 片段级修改依赖的拆合关系 */
+  dependsOn?: string;
+  /** 该冲突涉及的来源区域 */
+  sources?: RegionSource[];
   /** 基线版本中的值（删除类冲突时可能为 undefined 表示不存在） */
   baseValue: unknown;
   aValue: unknown;
@@ -66,7 +107,28 @@ export interface MergeConflict {
   message: string;
 }
 
-export type MergeResolution = 'a' | 'b';
+export type MergeResolution =
+  | 'a' | 'b'
+  | 'adopt-a' | 'adopt-b'
+  | 'confirmed' | 'rejected'
+  | 'discard' | 'disputed';
+
+export interface MergeDecisionRecord {
+  conflictId: string;
+  choice: MergeResolution;
+  decidedAt: string;
+}
+
+export interface MergeRelationRecord {
+  relationId: string;
+  decision: MergeRelationDecision;
+  decidedAt: string;
+}
+
+export interface MergeAudit {
+  relations: MergeRelationRecord[];
+  decisions: MergeDecisionRecord[];
+}
 
 /** 合并会话：可中途保存，之后继续逐项确认 */
 export interface MergeSession {
@@ -75,8 +137,10 @@ export interface MergeSession {
   baseVersion: number;
   aVersion: number;
   bVersion: number;
-  /** conflictId -> 选择哪一条修订 */
+  /** conflictId -> 采用、舍弃或保留争议 */
   resolutions: Record<string, MergeResolution>;
+  /** relationId -> 已确认/舍弃/争议的拆合关系 */
+  relations: Record<string, MergeRelationDecision>;
   createdAt: string;
   updatedAt: string;
 }

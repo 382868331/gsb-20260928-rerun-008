@@ -114,7 +114,7 @@ describe('merge', () => {
   });
 
   it('never silently drops delete-object vs hole-modification', () => {
-    const { img: base, obj1 } = baseImage();
+    const { img: base, obj1, obj2 } = baseImage();
     let img = revise(base, 1, (objs) => {
       const i = objs.findIndex((o) => o.id === obj1);
       objs.splice(i, 1); // A 删除物体
@@ -181,5 +181,79 @@ describe('merge', () => {
     const v = merged(img, session);
     expect(v.objects.find((o) => o.id === obj1)!.contours[0].holes).toHaveLength(2);
     expect(v.objects.find((o) => o.id === obj2)!.contours[0].points[1]).toEqual({ x: 185, y: 110 });
+  });
+
+  it('tracks split provenance and routes category and hole edits to applicable parts', () => {
+    const { img: base, obj1, obj2 } = baseImage();
+    let img = revise(base, 1, (objs) => {
+      const i = objs.findIndex((o) => o.id === obj1);
+      const createdAt = new Date().toISOString();
+      objs.splice(i, 1,
+        {
+          id: 'split-left', categoryId: cats[0].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([{ x: 10, y: 10 }, { x: 70, y: 10 }, { x: 70, y: 90 }, { x: 10, y: 90 }])],
+        },
+        {
+          id: 'split-right', categoryId: cats[0].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([{ x: 70, y: 10 }, { x: 90, y: 10 }, { x: 90, y: 90 }, { x: 70, y: 90 }])],
+        },
+      );
+    });
+    img = revise(img, 1, (objs) => {
+      const obj = objs.find((o) => o.id === obj1)!;
+      obj.categoryId = cats[2].id;
+      obj.contours[0].holes[0].points[0] = { x: 35, y: 35 };
+    });
+    const plan = planMerge(img, 2, 3);
+    const relation = plan.relations.find((r) => r.kind === 'split' && r.side === 'a')!;
+    expect(relation.sourceObjectIds).toEqual([obj1]);
+    expect(relation.targetObjectIds).toEqual(['split-left', 'split-right']);
+    const session = createMergeSession(img, 2, 3);
+    expect(() => applyMergeSession(img, session)).toThrow(/拆合关系未确认/);
+    session.relations[relation.id] = 'confirmed';
+    const partialPlan = planMerge(img, 2, 3);
+    const sourceConflicts = partialPlan.conflicts.filter((c) => c.dependsOn === relation.id);
+    expect(sourceConflicts.filter((c) => c.part === 'category').map((c) => c.objectId).sort()).toEqual(['split-left', 'split-right']);
+    expect(sourceConflicts.filter((c) => c.part === 'hole').map((c) => c.objectId)).toEqual(['split-left']);
+    for (const conflict of sourceConflicts) session.resolutions[conflict.id] = 'adopt-b';
+    const v = merged(img, session);
+    expect(v.objects.map((o) => o.id).sort()).toEqual([obj2, 'split-left', 'split-right'].sort());
+    const left = v.objects.find((o) => o.id === 'split-left')!;
+    const right = v.objects.find((o) => o.id === 'split-right')!;
+    expect(left.categoryId).toBe(cats[2].id);
+    expect(right.categoryId).toBe(cats[2].id);
+    expect(left.contours[0].holes[0].points[0]).toEqual({ x: 35, y: 35 });
+    expect(right.contours[0].holes).toEqual([]);
+    expect(left.provenance).toMatchObject({ transformation: 'split', sources: [{ objectId: obj1 }] });
+    expect(v.mergeAudit?.relations.some((r) => r.relationId === relation.id && r.decision === 'confirmed')).toBe(true);
+    expect(img.versions.map((version) => version.version)).toEqual([1, 2, 3]);
+  });
+
+  it('records every old object behind a merged result and avoids duplicate export', () => {
+    const { img: base, obj1, obj2 } = baseImage();
+    let img = revise(base, 1, (objs) => {
+      const createdAt = new Date().toISOString();
+      objs.splice(0, objs.length, {
+        id: 'merged-one',
+        categoryId: cats[1].id,
+        createdAt,
+        updatedAt: createdAt,
+        contours: [createContour([
+          { x: 10, y: 10 }, { x: 190, y: 10 }, { x: 190, y: 190 }, { x: 10, y: 190 },
+        ])],
+      });
+    });
+    img = revise(img, 1, () => {});
+    const plan = planMerge(img, 2, 3);
+    const relation = plan.relations.find((r) => r.kind === 'merge')!;
+    expect(relation.sourceObjectIds.sort()).toEqual([obj1, obj2].sort());
+    const session = createMergeSession(img, 2, 3);
+    session.relations[relation.id] = 'confirmed';
+    const v = merged(img, session);
+    expect(v.objects).toHaveLength(1);
+    expect(v.objects[0].id).toBe('merged-one');
+    expect(v.objects[0].provenance?.transformation).toBe('merge');
+    expect(v.objects[0].provenance?.sources.map((s) => s.objectId).sort()).toEqual([obj1, obj2].sort());
+    expect(v.mergeAudit?.decisions.length).toBeGreaterThan(0);
   });
 });

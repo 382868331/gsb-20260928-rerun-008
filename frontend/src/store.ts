@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { Category, ImageRecord, ImportResult, MergeResolution, MergeSession, Point } from './types';
+import type { Category, ImageRecord, ImportResult, MergeRelationDecision, MergeResolution, MergeSession, Point } from './types';
 import {
   addDraftObject,
   createContour,
@@ -15,7 +15,7 @@ import {
 import { createImage } from './core/versioning';
 import type { LoadedImage } from './core/images';
 import { exportProject, importProject } from './core/exchange';
-import { applyMergeSession, createMergeSession } from './core/merge';
+import { applyMergeSession, createMergeSession, planMerge } from './core/merge';
 import { uid } from './core/geometry';
 import { nowIso } from './core/versioning';
 
@@ -45,6 +45,7 @@ interface AppState {
   resetAll: () => void;
   startMerge: (aVersion: number, bVersion: number) => MergeSession;
   resolveConflict: (conflictId: string, choice: MergeResolution) => void;
+  resolveRelation: (relationId: string, decision: MergeRelationDecision) => void;
   unresolveConflict: (conflictId: string) => void;
   cancelMerge: () => void;
   completeMerge: (note?: string) => void;
@@ -224,10 +225,31 @@ export const useStore = create<AppState>()(
         set((s) => ({
           mergeSessions: s.mergeSessions.map((m) => {
             if (m.imageId !== s.selectedImageId) return m;
+            const image = s.images.find((i) => i.id === s.selectedImageId);
+            const planConflicts = image ? planMerge(image, m.aVersion, m.bVersion).conflicts : [];
             const resolutions = { ...m.resolutions };
+            const relations = { ...(m.relations ?? {}) };
             delete resolutions[conflictId];
-            return { ...m, resolutions, updatedAt: nowIso() };
+            const relationId = conflictId.startsWith('conflict:relation:')
+              ? conflictId.slice('conflict:'.length)
+              : null;
+            if (relationId) delete relations[relationId];
+            for (const conflict of planConflicts) {
+              if (conflict.dependsOn && (!relationId || conflict.dependsOn === relationId)) {
+                delete resolutions[conflict.id];
+              }
+            }
+            return { ...m, resolutions, relations, updatedAt: nowIso() };
           }),
+        })),
+
+      resolveRelation: (relationId, decision) =>
+        set((s) => ({
+          mergeSessions: s.mergeSessions.map((m) =>
+            m.imageId === s.selectedImageId
+              ? { ...m, relations: { ...(m.relations ?? {}), [relationId]: decision }, updatedAt: nowIso() }
+              : m,
+          ),
         })),
 
       cancelMerge: () =>
