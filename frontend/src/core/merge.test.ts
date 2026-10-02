@@ -256,4 +256,62 @@ describe('merge', () => {
     expect(v.objects[0].provenance?.sources.map((s) => s.objectId).sort()).toEqual([obj1, obj2].sort());
     expect(v.mergeAudit?.decisions.length).toBeGreaterThan(0);
   });
+
+  it('traces sources across chained split-then-merge while the other side edits the original', () => {
+    const { img: base, obj1, obj2 } = baseImage();
+    // 修订 A：obj1 先拆成左右两半，右半又与 obj2 合并为 merged-obj
+    let img = revise(base, 1, (objs) => {
+      const createdAt = new Date().toISOString();
+      objs.splice(0, objs.length,
+        {
+          id: 'split-left', categoryId: cats[0].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([{ x: 10, y: 10 }, { x: 70, y: 10 }, { x: 70, y: 90 }, { x: 10, y: 90 }])],
+        },
+        {
+          id: 'merged-obj', categoryId: cats[1].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([{ x: 70, y: 10 }, { x: 190, y: 10 }, { x: 190, y: 190 }, { x: 70, y: 190 }])],
+        },
+      );
+    });
+    // 修订 B：仍在修改最早物体 obj1 的类别和孔洞
+    img = revise(img, 1, (objs) => {
+      const obj = objs.find((o) => o.id === obj1)!;
+      obj.categoryId = cats[2].id;
+      obj.contours[0].holes[0].points[0] = { x: 35, y: 35 };
+    });
+    const plan = planMerge(img, 2, 3);
+    const splitRel = plan.relations.find((r) => r.kind === 'split')!;
+    const mergeRel = plan.relations.find((r) => r.kind === 'merge')!;
+    expect(splitRel.sourceObjectIds).toEqual([obj1]);
+    expect(mergeRel.sourceObjectIds.sort()).toEqual([obj1, obj2].sort());
+
+    // 允许只确认来源链的一部分后保存继续：仅确认拆分，合并关系留待以后
+    const session = createMergeSession(img, 2, 3);
+    session.relations[splitRel.id] = 'confirmed';
+    expect(() => applyMergeSession(img, session)).toThrow(/未确认/);
+
+    session.relations[mergeRel.id] = 'confirmed';
+    const sourceConflicts = planMerge(img, 2, 3).conflicts.filter((c) => c.dependsOn);
+    // B 对 obj1 的类别修改映射到两个最终区域；孔洞修改只映射到包含它的 split-left
+    expect(sourceConflicts.filter((c) => c.part === 'category').map((c) => c.objectId).sort())
+      .toEqual(['merged-obj', 'split-left']);
+    expect(sourceConflicts.filter((c) => c.part === 'hole').map((c) => c.objectId))
+      .toEqual(['split-left']);
+    for (const conflict of sourceConflicts) session.resolutions[conflict.id] = 'adopt-b';
+
+    const v = merged(img, session);
+    // 中间物体（拆分出的右半）不重复导出，只有两个最终区域
+    expect(v.objects.map((o) => o.id).sort()).toEqual(['merged-obj', 'split-left']);
+    const left = v.objects.find((o) => o.id === 'split-left')!;
+    const big = v.objects.find((o) => o.id === 'merged-obj')!;
+    expect(left.provenance?.sources.map((s) => s.objectId)).toEqual([obj1]);
+    expect(big.provenance?.transformation).toBe('merge');
+    expect(big.provenance?.sources.map((s) => s.objectId).sort()).toEqual([obj1, obj2].sort());
+    expect(left.categoryId).toBe(cats[2].id);
+    expect(big.categoryId).toBe(cats[2].id);
+    expect(left.contours[0].holes[0].points[0]).toEqual({ x: 35, y: 35 });
+    // 原修订与合并审计均可追溯
+    expect(v.mergeOf).toEqual({ base: 1, a: 2, b: 3 });
+    expect(img.versions.map((version) => version.version)).toEqual([1, 2, 3]);
+  });
 });

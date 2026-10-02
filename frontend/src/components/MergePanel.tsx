@@ -142,6 +142,15 @@ export function MergePanel({ image }: { image: ImageRecord }) {
     }
   }, [image, session]);
 
+  const relationById = useMemo(() => {
+    if (!session) return new Map<string, MergeRelationDecision>();
+    try {
+      return new Map(planMerge(image, session.aVersion, session.bVersion).relations.map((r) => [r.id, session.relations?.[r.id]]).filter((x): x is [string, MergeRelationDecision] => !!x[1]));
+    } catch {
+      return new Map();
+    }
+  }, [image, session]);
+
   if (!session) {
     return (
       <div className="merge-panel">
@@ -197,14 +206,6 @@ export function MergePanel({ image }: { image: ImageRecord }) {
     );
   }
 
-  const relationById = useMemo(() => {
-    if (!session) return new Map<string, MergeRelationDecision>();
-    try {
-      return new Map(planMerge(image, session.aVersion, session.bVersion).relations.map((r) => [r.id, session.relations?.[r.id]]).filter((x): x is [string, MergeRelationDecision] => !!x[1]));
-    } catch {
-      return new Map();
-    }
-  }, [image, session]);
   const isRelationConflict = (c: MergeConflict) => c.id.startsWith('conflict:relation:');
   const statusOf = (c: MergeConflict) =>
     isRelationConflict(c)
@@ -244,7 +245,15 @@ export function MergePanel({ image }: { image: ImageRecord }) {
           className="primary"
           disabled={!allDone}
           title={allDone ? '生成新的合并提交' : '还有冲突未确认'}
-          onClick={() => completeMerge()}
+          onClick={() => {
+            try {
+              completeMerge();
+              setError(null);
+            } catch (err) {
+              // 合并失败时保留会话与已确认的决定，界面不崩溃
+              setError((err as Error).message);
+            }
+          }}
         >
           <GitMerge size={14} /> 完成合并（生成新提交，历史版本不变）
         </button>
@@ -252,6 +261,7 @@ export function MergePanel({ image }: { image: ImageRecord }) {
           <X size={14} /> 放弃合并
         </button>
       </div>
+      {error && <p className="error">{error}</p>}
     </div>
   );
 }

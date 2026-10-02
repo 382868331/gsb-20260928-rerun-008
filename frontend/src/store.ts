@@ -234,9 +234,13 @@ export const useStore = create<AppState>()(
               ? conflictId.slice('conflict:'.length)
               : null;
             if (relationId) delete relations[relationId];
-            for (const conflict of planConflicts) {
-              if (conflict.dependsOn && (!relationId || conflict.dependsOn === relationId)) {
-                delete resolutions[conflict.id];
+            // 只有撤回拆合关系时才级联重开真正依赖它的片段决定；
+            // 撤回普通片段决定不影响其他区域已作出的选择
+            if (relationId) {
+              for (const conflict of planConflicts) {
+                if (conflict.dependsOn === relationId) {
+                  delete resolutions[conflict.id];
+                }
               }
             }
             return { ...m, resolutions, relations, updatedAt: nowIso() };

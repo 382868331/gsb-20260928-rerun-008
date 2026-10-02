@@ -478,29 +478,30 @@ function addSourceLevelConflicts(
     const otherObj = otherVersion.objects.find((o) => o.id === sourceId);
     if (!baseObj || !otherObj) continue;
     const applicableTargets = targets.filter((t) =>
-      t.contours.some((tc) => {
-        const center = contourCenter(tc.points);
-        return baseObj.contours.some((sc) => pointInPolygon(center, sc.points));
-      }),
+      t.contours.some((tc) =>
+        baseObj.contours.some((sc) => polygonsShareArea(tc.points, sc.points)),
+      ),
     );
     for (const target of applicableTargets) {
       if (otherObj.categoryId !== baseObj.categoryId) {
-        const id = 'category-source:' + relation.id + ':' + sourceId + ':' + target.id;
-        const conflict: MergeConflict = {
-          id,
-          objectId: target.id,
-          part: 'category',
-          dependsOn: relation.id,
-          sources: [{ objectId: sourceId }],
-          baseValue: baseObj.categoryId,
-          aValue: relation.side === 'a' ? target.categoryId : otherObj.categoryId,
-          bValue: relation.side === 'b' ? target.categoryId : otherObj.categoryId,
-          message: '来源物体 ' + sourceId + ' 的类别修改对应拆分/合并后的物体 ' + target.id,
-        };
-        ctx.conflicts.push(conflict);
+        // 同一来源对同一最终区域的修改只裁决一次（连续拆合可能经多条关系到达同一目标）
+        const id = 'category-source:' + sourceId + ':' + target.id;
+        if (!ctx.conflicts.some((c) => c.id === id)) {
+          ctx.conflicts.push({
+            id,
+            objectId: target.id,
+            part: 'category',
+            dependsOn: relation.id,
+            sources: [{ objectId: sourceId }],
+            baseValue: baseObj.categoryId,
+            aValue: relation.side === 'a' ? target.categoryId : otherObj.categoryId,
+            bValue: relation.side === 'b' ? target.categoryId : otherObj.categoryId,
+            message: '来源物体 ' + sourceId + ' 的类别修改对应拆分/合并后的物体 ' + target.id,
+          });
+        }
         const decision = ctx.resolutions[id];
-        if (!decision && ctx.strict) throw new Error('片段冲突未确认：' + conflict.message);
-        if (decision === 'disputed' && ctx.strict) throw new Error('片段冲突仍有争议：' + conflict.message);
+        if (!decision && ctx.strict) throw new Error('片段冲突未确认：来源物体 ' + sourceId + ' 的类别修改对应 ' + target.id);
+        if (decision === 'disputed' && ctx.strict) throw new Error('片段冲突仍有争议：来源物体 ' + sourceId + ' 的类别修改对应 ' + target.id);
         const adoptOther = decision === (relation.side === 'a' ? 'adopt-b' : 'adopt-a');
         if (adoptOther) target.categoryId = otherObj.categoryId;
       }
@@ -520,24 +521,25 @@ function addSourceLevelConflicts(
         const structuralPoints = targetHole?.points ?? DELETED;
         const otherPoints = otherHole?.points ?? DELETED;
         if (otherHole && !eq(otherHole.points, entry.hole.points) && !eq(structuralPoints, otherPoints)) {
-          const id = 'hole-source:' + relation.id + ':' + sourceId + ':' + target.id + ':' + entry.hole.id;
-          const conflict: MergeConflict = {
-            id,
-            objectId: target.id,
-            part: 'hole',
-            contourId: entry.contour.id,
-            holeId: entry.hole.id,
-            dependsOn: relation.id,
-            sources: [{ objectId: sourceId, contourId: entry.contour.id, holeId: entry.hole.id }],
-            baseValue: entry.hole.points,
-            aValue: relation.side === 'a' ? structuralPoints : otherPoints,
-            bValue: relation.side === 'b' ? structuralPoints : otherPoints,
-            message: '来源物体 ' + sourceId + ' 的孔洞修改对应拆分/合并后的物体 ' + target.id,
-          };
-          ctx.conflicts.push(conflict);
+          const id = 'hole-source:' + sourceId + ':' + target.id + ':' + entry.hole.id;
+          if (!ctx.conflicts.some((c) => c.id === id)) {
+            ctx.conflicts.push({
+              id,
+              objectId: target.id,
+              part: 'hole',
+              contourId: entry.contour.id,
+              holeId: entry.hole.id,
+              dependsOn: relation.id,
+              sources: [{ objectId: sourceId, contourId: entry.contour.id, holeId: entry.hole.id }],
+              baseValue: entry.hole.points,
+              aValue: relation.side === 'a' ? structuralPoints : otherPoints,
+              bValue: relation.side === 'b' ? structuralPoints : otherPoints,
+              message: '来源物体 ' + sourceId + ' 的孔洞修改对应拆分/合并后的物体 ' + target.id,
+            });
+          }
           const decision = ctx.resolutions[id];
-          if (!decision && ctx.strict) throw new Error('片段冲突未确认：' + conflict.message);
-          if (decision === 'disputed' && ctx.strict) throw new Error('片段冲突仍有争议：' + conflict.message);
+          if (!decision && ctx.strict) throw new Error('片段冲突未确认：来源物体 ' + sourceId + ' 的孔洞修改对应 ' + target.id);
+          if (decision === 'disputed' && ctx.strict) throw new Error('片段冲突仍有争议：来源物体 ' + sourceId + ' 的孔洞修改对应 ' + target.id);
           const adoptOther = decision === (relation.side === 'a' ? 'adopt-b' : 'adopt-a');
           if (adoptOther) {
             for (const c of target.contours) {
