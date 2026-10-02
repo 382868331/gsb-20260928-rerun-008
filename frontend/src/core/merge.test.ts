@@ -256,4 +256,132 @@ describe('merge', () => {
     expect(v.objects[0].provenance?.sources.map((s) => s.objectId).sort()).toEqual([obj1, obj2].sort());
     expect(v.mergeAudit?.decisions.length).toBeGreaterThan(0);
   });
+
+  it('follows a continuous split then partial-merge chain and never exports intermediates', () => {
+    const { img: base, obj1, obj2 } = baseImage();
+    const createdAt = new Date().toISOString();
+    // A 连续返工：obj1 先拆成 split-left / split-right，split-right 随后扩张并与 obj2 局部合并为 merged-2
+    let img = revise(base, 1, (objs) => {
+      objs.splice(0, objs.length,
+        {
+          id: 'split-left', categoryId: cats[0].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([{ x: 10, y: 10 }, { x: 50, y: 10 }, { x: 50, y: 90 }, { x: 10, y: 90 }])],
+        },
+        {
+          id: 'merged-2', categoryId: cats[1].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([
+            { x: 50, y: 10 }, { x: 100, y: 10 }, { x: 100, y: 100 }, { x: 190, y: 100 },
+            { x: 190, y: 190 }, { x: 110, y: 190 }, { x: 110, y: 100 }, { x: 50, y: 100 },
+          ])],
+        },
+      );
+    });
+    // B 仍在修改最早物体 obj1 的类别
+    img = revise(img, 1, (objs) => {
+      objs.find((o) => o.id === obj1)!.categoryId = cats[2].id;
+    });
+    const plan = planMerge(img, 2, 3);
+    const split = plan.relations.find((r) => r.kind === 'split' && r.side === 'a')!;
+    const mergeRel = plan.relations.find((r) => r.kind === 'merge' && r.side === 'a')!;
+    expect(split.targetObjectIds.sort()).toEqual(['merged-2', 'split-left']);
+    // 该场景没有独立的中间物体：直接来源记录根物体 obj1 与 obj2，上游拆分是其前置
+    expect(mergeRel.sourceObjectIds.sort()).toEqual([obj1, obj2].sort());
+    expect(mergeRel.prerequisiteRelationIds).toContain(split.id);
+    // 最终来源始终追溯到基线，中间物体不出现
+    expect(mergeRel.baseSourceObjectIds?.sort()).toEqual([obj1, obj2].sort());
+
+    const session = createMergeSession(img, 2, 3);
+    // 允许只确认来源链的一部分（先确认拆分）后“保存继续”：不抛错且不会落地半成品
+    session.relations[split.id] = 'confirmed';
+    expect(() => applyMergeSession(img, session)).toThrow(/未确认/);
+
+    session.relations[mergeRel.id] = 'confirmed';
+    const sourceConflicts = plan.conflicts.filter((c) => c.dependsOn);
+    // 同一处类别修改沿链映射到每个最终区域，逐区域决定
+    const catTargets = sourceConflicts.filter((c) => c.part === 'category').map((c) => c.objectId).sort();
+    expect(catTargets).toEqual(['merged-2', 'split-left']);
+    for (const c of sourceConflicts) session.resolutions[c.id] = 'adopt-b';
+    const v = merged(img, session);
+    expect(v.objects.map((o) => o.id).sort()).toEqual(['merged-2', 'split-left']);
+    const finalMerged = v.objects.find((o) => o.id === 'merged-2')!;
+    const leafSources = finalMerged.provenance!.sources.map((s) => s.objectId).sort();
+    expect(leafSources).toEqual([obj1, obj2].sort());
+    expect(finalMerged.provenance!.sources.some((s) => s.objectId === 'split-right')).toBe(false);
+    expect(finalMerged.categoryId).toBe(cats[2].id);
+  });
+
+    it('undoing an upstream split reopens only dependent downstream decisions', () => {
+    const { img: base, obj1, obj2 } = baseImage();
+    const createdAt = new Date().toISOString();
+    let img = revise(base, 1, (objs) => {
+      objs.splice(0, objs.length,
+        {
+          id: 'split-left', categoryId: cats[0].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([{ x: 10, y: 10 }, { x: 50, y: 10 }, { x: 50, y: 90 }, { x: 10, y: 90 }])],
+        },
+        {
+          id: 'merged-2', categoryId: cats[1].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([
+            { x: 50, y: 10 }, { x: 100, y: 10 }, { x: 100, y: 100 }, { x: 190, y: 100 },
+            { x: 190, y: 190 }, { x: 110, y: 190 }, { x: 110, y: 100 }, { x: 50, y: 100 },
+          ])],
+        },
+      );
+    });
+    img = revise(img, 1, (objs) => {
+      objs.find((o) => o.id === obj1)!.categoryId = cats[2].id;
+    });
+    const plan = planMerge(img, 2, 3);
+    const split = plan.relations.find((r) => r.kind === 'split')!;
+    const mergeRel = plan.relations.find((r) => r.kind === 'merge')!;
+    const session = createMergeSession(img, 2, 3);
+    session.relations[split.id] = 'confirmed';
+    session.relations[mergeRel.id] = 'confirmed';
+    for (const c of plan.conflicts.filter((c) => c.dependsOn)) session.resolutions[c.id] = 'adopt-b';
+    // 撤回上游拆分：模拟 store 的级联——拆分、下游合并及依赖它们的片段决定全部重开
+    delete session.relations[split.id];
+    delete session.relations[mergeRel.id];
+    for (const c of plan.conflicts.filter((c) => c.dependsOn === split.id || c.dependsOn === mergeRel.id)) delete session.resolutions[c.id];
+    expect(session.relations[mergeRel.id]).toBeUndefined();
+    expect(Object.values(session.resolutions).filter((x) => x === 'adopt-b')).toHaveLength(0);
+    expect(() => applyMergeSession(img, session)).toThrow();
+    // obj2 不依赖该链：这里没有其它决定，但其它图片/区域的会话数据天然保留在 session 中
+    expect(mergeRel.prerequisiteRelationIds).toContain(split.id);
+  });
+
+  it('surfaces holes that cross the split boundary instead of silently duplicating them', () => {
+    const { img: base, obj1, obj2 } = baseImage();
+    // 孔洞跨在拆分边界 x=70 上：30..80
+    let img = revise(base, 1, (objs) => {
+      const obj = objs.find((o) => o.id === obj1)!;
+      obj.contours[0].holes[0].points = [
+        { x: 30, y: 30 }, { x: 80, y: 30 }, { x: 80, y: 60 }, { x: 30, y: 60 },
+      ];
+    });
+    const createdAt = new Date().toISOString();
+    img = revise(img, 1, (objs) => {
+      objs.splice(objs.findIndex((o) => o.id === obj1), 1,
+        {
+          id: 'split-left', categoryId: cats[0].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([{ x: 10, y: 10 }, { x: 70, y: 10 }, { x: 70, y: 90 }, { x: 10, y: 90 }])],
+        },
+        {
+          id: 'split-right', categoryId: cats[0].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([{ x: 70, y: 10 }, { x: 90, y: 10 }, { x: 90, y: 90 }, { x: 70, y: 90 }])],
+        },
+      );
+    });
+    const plan = planMerge(img, 2, 3);
+    const split = plan.relations.find((r) => r.kind === 'split')!;
+    expect(plan.conflicts.some((c) => c.part === 'hole-cross')).toBe(true);
+    const session = createMergeSession(img, 2, 3);
+    session.relations[split.id] = 'confirmed';
+    // 歧义未裁决不能提交
+    expect(() => applyMergeSession(img, session)).toThrow(/片段冲突未确认/);
+    for (const c of plan.conflicts.filter((c) => !c.id.startsWith('conflict:relation:') && c.dependsOn)) {
+      session.resolutions[c.id] = 'adopt-a';
+    }
+    const v = merged(img, session);
+    expect(v.objects.map((o) => o.id).sort()).toEqual(['split-left', 'split-right', obj2].sort());
+  });
 });

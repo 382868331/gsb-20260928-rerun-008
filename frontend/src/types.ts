@@ -67,8 +67,13 @@ export interface MergeRelation {
   id: string;
   kind: MergeRelationKind;
   side: 'a' | 'b';
+  /** 直接来源物体 id；可能是基线物体，也可能是同一条修订链中前一步产生的中间物体 */
   targetObjectIds: string[];
   sourceObjectIds: string[];
+  /** 沿来源链追溯到的基线物体 id（中间物体不进入最终来源） */
+  baseSourceObjectIds?: string[];
+  /** 应用本关系前必须先确认的上游拆合关系 id */
+  prerequisiteRelationIds?: string[];
   sourceContourIds?: string[];
   sourceHoleIds?: string[];
   message: string;
@@ -86,7 +91,8 @@ export type MergePartKind =
   | 'split-relation'
   | 'merge-relation'
   | 'hole-promotion'
-  | 'duplicate-region';
+  | 'duplicate-region'
+  | 'hole-cross';
 
 /** 一处需要用户裁决的冲突：同一物体同一部分被两条修订改成了不同结果 */
 export interface MergeConflict {

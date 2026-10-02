@@ -226,17 +226,35 @@ export const useStore = create<AppState>()(
           mergeSessions: s.mergeSessions.map((m) => {
             if (m.imageId !== s.selectedImageId) return m;
             const image = s.images.find((i) => i.id === s.selectedImageId);
-            const planConflicts = image ? planMerge(image, m.aVersion, m.bVersion).conflicts : [];
+            const plan = image ? planMerge(image, m.aVersion, m.bVersion) : null;
+            const planConflicts = plan?.conflicts ?? [];
+            const planRelations = plan?.relations ?? [];
             const resolutions = { ...m.resolutions };
             const relations = { ...(m.relations ?? {}) };
             delete resolutions[conflictId];
             const relationId = conflictId.startsWith('conflict:relation:')
               ? conflictId.slice('conflict:'.length)
               : null;
-            if (relationId) delete relations[relationId];
-            for (const conflict of planConflicts) {
-              if (conflict.dependsOn && (!relationId || conflict.dependsOn === relationId)) {
-                delete resolutions[conflict.id];
+            if (relationId) {
+              // 撤回拆合关系：删除自身决定，并重新打开真正依赖它（直接或沿链）的下游关系与片段决定；
+              // 其他区域已冻结的决定原样保留。
+              const reopened = new Set<string>([relationId]);
+              let grew = true;
+              while (grew) {
+                grew = false;
+                for (const rel of planRelations) {
+                  if (reopened.has(rel.id)) continue;
+                  if ((rel.prerequisiteRelationIds ?? []).some((pre) => reopened.has(pre))) {
+                    reopened.add(rel.id);
+                    grew = true;
+                  }
+                }
+              }
+              for (const id of reopened) delete relations[id];
+              for (const conflict of planConflicts) {
+                if (conflict.dependsOn && reopened.has(conflict.dependsOn)) {
+                  delete resolutions[conflict.id];
+                }
               }
             }
             return { ...m, resolutions, relations, updatedAt: nowIso() };

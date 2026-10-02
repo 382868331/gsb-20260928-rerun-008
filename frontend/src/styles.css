@@ -170,3 +170,7 @@ svg.drawing { cursor: crosshair; }
 .val.deleted { color: #f87171; }
 .conflict-actions, .merge-actions { display: flex; gap: 8px; align-items: center; }
 .merge-actions { margin-top: 8px; }
+.conflict-chain { margin: 0 0 4px; font-size: 12px; color: #93c5fd; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.chain-step { display: inline-flex; align-items: center; gap: 3px; background: #172033; border-radius: 4px; padding: 1px 5px; }
+.conflict-sources { font-size: 12px; margin: 0 0 4px; }
+.merge-resume { border: 1px dashed #475569; border-radius: 8px; }

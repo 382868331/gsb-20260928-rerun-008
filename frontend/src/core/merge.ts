@@ -269,14 +269,6 @@ function contourCenter(points: Point[]): Point {
   return { x: sum.x / points.length, y: sum.y / points.length };
 }
 
-function objectContours(obj: AnnotationObject | undefined): { contour: Contour; object: AnnotationObject }[] {
-  return (obj?.contours ?? []).map((contour) => ({ contour, object: obj! }));
-}
-
-function contourOverlapsObject(contour: Contour, obj: AnnotationObject): boolean {
-  return obj.contours.some((other) => polygonsShareArea(contour.points, other.points));
-}
-
 function polygonsShareArea(a: Point[], b: Point[]): boolean {
   if (polygonArea(a) === 0 || polygonArea(b) === 0) return false;
   const strictlyInside = (p: Point, poly: Point[]) => pointInPolygon(p, poly) && !pointOnPolygonBoundary(p, poly);
@@ -292,70 +284,146 @@ function relationKey(parts: string[]): string {
   return [...new Set(parts)].sort().join('+');
 }
 
-function detectSideRelations(side: 'a' | 'b', base: ImageVersion, revised: ImageVersion): MergeRelation[] {
-  const revisedById = new Map(revised.objects.map((o) => [o.id, o]));
-  const out: MergeRelation[] = [];
+interface FlowCell {
+  target: AnnotationObject;
+  shares: boolean;
+}
 
+/** 基线物体与修订中新结构物体之间的区域流动矩阵 */
+function flowMatrix(base: ImageVersion, revised: ImageVersion, structuralIds: Set<string>) {
+  const targets = revised.objects.filter((o) => structuralIds.has(o.id));
+  const rows = new Map<string, Map<string, FlowCell>>();
   for (const source of base.objects) {
-    const targets = revised.objects.filter((target) =>
-      target.contours.some((tc) => source.contours.some((sc) => polygonsShareArea(tc.points, sc.points))),
-    );
-    const newTargets = targets.filter((t) => !base.objects.some((b) => b.id === t.id));
-    if (newTargets.length > 1) {
-      const id = 'relation:split:' + side + ':' + source.id + ':' + relationKey(newTargets.map((t) => t.id));
-      if (!out.some((r) => r.id === id)) {
-        out.push({
-          id,
-          kind: 'split',
-          side,
-          sourceObjectIds: [source.id],
-          targetObjectIds: newTargets.map((t) => t.id),
-          message: '修订 ' + side.toUpperCase() + ' 将物体 ' + source.id + ' 拆分为 ' + newTargets.length + ' 个物体',
-        });
-      }
+    const row = new Map<string, FlowCell>();
+    for (const target of targets) {
+      const shares = target.contours.some((tc) =>
+        source.contours.some((sc) => polygonsShareArea(tc.points, sc.points)),
+      );
+      if (shares) row.set(target.id, { target, shares });
     }
+    rows.set(source.id, row);
+  }
+  return { targets, rows };
+}
 
+/**
+ * 识别一侧修订中的拆合结构，支持连续返工链：
+ * 一个基线物体先拆成多个中间物体，其中某个中间物体又与别的（中间）物体合并。
+ * 直接来源记录中间物体 id，baseSourceObjectIds 始终追溯到基线物体。
+ */
+function detectSideRelations(side: 'a' | 'b', base: ImageVersion, revised: ImageVersion): MergeRelation[] {
+  const out: MergeRelation[] = [];
+  const baseIds = new Set(base.objects.map((o) => o.id));
+  // 结构物体：修订中新出现的 id（id 不变、只改类别/孔洞的物体不参与拆合）
+  const structuralIds = new Set(revised.objects.filter((o) => !baseIds.has(o.id)).map((o) => o.id));
+  const { targets, rows } = flowMatrix(base, revised, structuralIds);
+  const targetById = new Map(targets.map((t) => [t.id, t]));
+
+  // 孔洞提升为外轮廓：始终保留为独立关系，要求人工确认
+  for (const source of base.objects) {
     for (const sc of source.contours) {
       for (const hole of sc.holes) {
         const promoted = revised.objects.filter((obj) =>
-          obj.contours.some((c) =>
-            obj.id !== source.id &&
+          structuralIds.has(obj.id) &&
+            obj.contours.some((c) =>
               polygonsShareArea(c.points, hole.points) &&
-              polygonArea(c.points) <= polygonArea(hole.points) * 3,
-          ),
+                polygonArea(c.points) <= polygonArea(hole.points) * 3,
+            ),
         );
-        if (promoted.length > 0) {
+        for (const obj of promoted) {
           out.push({
-            id: 'relation:hole-promotion:' + side + ':' + source.id + ':' + sc.id + ':' + hole.id,
+            id: 'relation:hole-promotion:' + side + ':' + source.id + ':' + sc.id + ':' + hole.id + ':' + obj.id,
             kind: 'hole-to-outline',
             side,
             sourceObjectIds: [source.id],
+            baseSourceObjectIds: [source.id],
             sourceContourIds: [sc.id],
             sourceHoleIds: [hole.id],
-            targetObjectIds: promoted.map((o) => o.id),
-            message: '修订 ' + side.toUpperCase() + ' 将物体 ' + source.id + ' 的孔洞 ' + hole.id + ' 用作外轮廓，需要明确确认',
+            targetObjectIds: [obj.id],
+            prerequisiteRelationIds: [],
+            message: '修订 ' + side.toUpperCase() + ' 将物体 ' + source.id + ' 的孔洞 ' + hole.id + ' 提升为物体 ' + obj.id + ' 的外轮廓',
           });
         }
       }
     }
   }
 
-  for (const target of revised.objects) {
-    if (base.objects.some((o) => o.id === target.id)) continue;
-    const sources = base.objects.filter((source) => contourOverlapsObject(target.contours[0], source));
-    if (sources.length > 1) {
+  // 结构目标 -> 它覆盖到的基线物体（合并的祖先来源）
+  const targetRoots = new Map<string, Set<string>>();
+  for (const target of targets) {
+    const roots = new Set<string>();
+    for (const source of base.objects) {
+      if (rows.get(source.id)?.has(target.id)) roots.add(source.id);
+    }
+    targetRoots.set(target.id, roots);
+  }
+
+  // 1) 拆分：同一基线物体的区域流向了多个新物体
+  const splitTargetsByRoot = new Map<string, Set<string>>();
+  for (const source of base.objects) {
+    const reached = [...(rows.get(source.id)?.keys() ?? [])];
+    if (reached.length > 1) {
+      splitTargetsByRoot.set(source.id, new Set(reached));
       out.push({
-        id: 'relation:merge:' + side + ':' + relationKey(sources.map((s) => s.id)) + ':' + target.id,
-        kind: 'merge',
+        id: 'relation:split:' + side + ':' + source.id + ':' + relationKey(reached),
+        kind: 'split',
         side,
-        sourceObjectIds: sources.map((s) => s.id),
-        targetObjectIds: [target.id],
-        message: '修订 ' + side.toUpperCase() + ' 将 ' + sources.length + ' 个物体合并为 ' + target.id,
+        sourceObjectIds: [source.id],
+        baseSourceObjectIds: [source.id],
+        targetObjectIds: reached.slice().sort(),
+        prerequisiteRelationIds: [],
+        message: '修订 ' + side.toUpperCase() + ' 将物体 ' + source.id + ' 拆分为 ' + reached.length + ' 个物体（' + reached.sort().join('、') + '）',
       });
     }
   }
 
-  return out.filter((r, i, all) => all.findIndex((x) => x.id === r.id) === i);
+  // 2) 合并 / 局部合并：一个新物体覆盖了多个（追溯到基线的）来源物体。
+  //    直接来源按几何关系给出：能对上拆分产物时引用中间物体，否则直接引用基线物体。
+  for (const target of targets) {
+    const roots = [...(targetRoots.get(target.id) ?? [])].sort();
+    if (roots.length < 2) continue;
+    const directSources: string[] = [];
+    const prerequisites: string[] = [];
+    for (const rootId of roots) {
+      const splitSet = splitTargetsByRoot.get(rootId);
+      const splitRelId = 'relation:split:' + side + ':' + rootId + ':' + relationKey([...(splitSet ?? [])].sort());
+      if (splitSet?.has(target.id)) {
+        // 目标本身就是拆分产物之一（可能就地扩张完成局部合并）：根来源经由拆分链到达，
+        // 但拆分产物中没有独立的中间物体可引用
+        prerequisites.push(splitRelId);
+        directSources.push(rootId);
+      } else {
+        // 目标不是拆分产物：与它区域重合的拆分中间物体即为直接来源
+        const intermediates = splitSet
+          ? [...splitSet].filter((tid) => shareArea(targetById.get(tid)!, target))
+          : [];
+        if (intermediates.length > 0) {
+          for (const tid of intermediates) directSources.push(tid);
+          prerequisites.push(splitRelId);
+        } else {
+          directSources.push(rootId);
+        }
+      }
+    }
+    const uniqSources = [...new Set(directSources)].sort();
+    if (uniqSources.length < 2) continue; // 不是真合并（同一来源的碎片相触）
+    out.push({
+      id: 'relation:merge:' + side + ':' + relationKey(uniqSources) + ':' + target.id,
+      kind: 'merge',
+      side,
+      sourceObjectIds: uniqSources,
+      baseSourceObjectIds: roots,
+      targetObjectIds: [target.id],
+      prerequisiteRelationIds: [...new Set(prerequisites)].sort(),
+      message: '修订 ' + side.toUpperCase() + ' 将 ' + uniqSources.length + ' 个来源（' + uniqSources.join('、') + '）局部合并为 ' + target.id,
+    });
+  }
+
+  return out;
+}
+
+function shareArea(a: AnnotationObject, b: AnnotationObject): boolean {
+  return a.contours.some((ca) => b.contours.some((cb) => polygonsShareArea(ca.points, cb.points)));
 }
 
 export function detectMergeRelations(base: ImageVersion, a: ImageVersion, b: ImageVersion): MergeRelation[] {
@@ -367,27 +435,56 @@ function normalizeSession(session: MergeSession): MergeSession {
 }
 
 function provenanceSources(relation: MergeRelation): RegionSource[] {
-  return relation.sourceObjectIds.map((objectId) => {
-    const source: RegionSource = { objectId };
-    source.contourId = relation.sourceContourIds?.[0];
-    source.holeId = relation.sourceHoleIds?.[0];
-    return source;
-  });
+  // 始终追溯到基线物体：连续返工链中的中间物体不能作为最终来源导出
+  return (relation.baseSourceObjectIds ?? relation.sourceObjectIds).map((objectId) => ({
+    objectId,
+    contourId: relation.sourceContourIds?.find((cid) => cid) as string | undefined,
+    holeId: relation.sourceHoleIds?.find((hid) => hid) as string | undefined,
+  }));
+}
+
+/** 把已有 provenance 与本关系的基线来源拍平：去重，中间物体不进入来源链 */
+function flattenSources(
+  relation: MergeRelation,
+  sourceObjects: Map<string, AnnotationObject>,
+  baseIds: Set<string>,
+): RegionSource[] {
+  const merged: RegionSource[] = [];
+  const seen = new Set<string>();
+  const push = (source: RegionSource) => {
+    const key = source.objectId + ':' + (source.contourId ?? '') + ':' + (source.holeId ?? '');
+    if (!seen.has(key)) {
+      seen.add(key);
+      merged.push(source);
+    }
+  };
+  for (const sourceId of relation.sourceObjectIds) {
+    const sourceObj = sourceObjects.get(sourceId);
+    const fromBase = baseIds.has(sourceId);
+    if (fromBase || !sourceObj?.provenance) {
+      push({ objectId: sourceId, holeId: relation.sourceHoleIds?.[0] });
+    } else {
+      for (const leaf of sourceObj.provenance.sources) push(leaf);
+    }
+  }
+  for (const rootId of relation.baseSourceObjectIds ?? []) push({ objectId: rootId });
+  return merged;
 }
 
 function addRelationConflict(ctx: Ctx, relation: MergeRelation, decision: MergeRelationDecision | undefined): void {
   const id = 'conflict:' + relation.id;
-  const conflict: MergeConflict = {
-    id,
-    objectId: relation.targetObjectIds[0] ?? relation.sourceObjectIds[0],
-    part: relation.kind === 'split' ? 'split-relation' : relation.kind === 'merge' ? 'merge-relation' : 'hole-promotion',
-    sources: provenanceSources(relation),
-    baseValue: relation.sourceObjectIds.join(', '),
-    aValue: relation.side === 'a' ? relation.targetObjectIds.join(', ') : null,
-    bValue: relation.side === 'b' ? relation.targetObjectIds.join(', ') : null,
-    message: relation.message,
-  };
-  if (!ctx.conflicts.some((c) => c.id === id)) ctx.conflicts.push(conflict);
+  if (!ctx.conflicts.some((c) => c.id === id)) {
+    ctx.conflicts.push({
+      id,
+      objectId: relation.targetObjectIds[0] ?? relation.sourceObjectIds[0],
+      part: relation.kind === 'split' ? 'split-relation' : relation.kind === 'merge' ? 'merge-relation' : 'hole-promotion',
+      sources: provenanceSources(relation),
+      baseValue: relation.sourceObjectIds.join(', '),
+      aValue: relation.side === 'a' ? relation.targetObjectIds.join(', ') : null,
+      bValue: relation.side === 'b' ? relation.targetObjectIds.join(', ') : null,
+      message: relation.message,
+    });
+  }
   if (!decision && ctx.strict) throw new Error('拆合关系未确认：' + relation.message);
   if (decision === 'disputed' && ctx.strict) throw new Error('拆合关系仍有争议：' + relation.message);
 }
@@ -411,26 +508,25 @@ function mergeByIds(
   return { objects, conflicts: ctx.conflicts };
 }
 
-function sourceContours(base: ImageVersion, sourceIds: string[]) {
-  return base.objects.filter((o) => sourceIds.includes(o.id)).flatMap(objectContours);
-}
-
-function holesInsideTarget(target: AnnotationObject, sourceHoles: { contour: Contour; hole: Contour['holes'][number]; sourceObjectId: string }[]) {
-  return sourceHoles.filter((entry) =>
-    target.contours.some((tc) => entry.hole.points.every((p) => pointInPolygon(p, tc.points))),
-  );
-}
-
-function attachProvenance(obj: AnnotationObject, relation: MergeRelation, base: ImageVersion): AnnotationObject {
+function attachProvenance(
+  obj: AnnotationObject,
+  relation: MergeRelation,
+  available: Map<string, AnnotationObject>,
+  base: ImageVersion,
+): AnnotationObject {
   const next = finalizeObject(obj);
   const sources: RegionSource[] = [];
-  const baseObjectsById = new Map(base.objects.map((sourceObj) => [sourceObj.id, sourceObj]));
-  for (const sourceId of relation.sourceObjectIds) {
-    const sourceContours = baseObjectsById.get(sourceId)?.contours ?? [];
-    for (const sourceContour of sourceContours) {
-      if (obj.contours.some((targetContour) => polygonsShareArea(targetContour.points, sourceContour.points))) {
-        sources.push({ objectId: sourceId, contourId: sourceContour.id, holeId: relation.sourceHoleIds?.[0] });
-      }
+  const baseIds = new Set(base.objects.map((o) => o.id));
+  const flat = flattenSources(relation, available, baseIds);
+  for (const leaf of flat) {
+    const baseObj = base.objects.find((o) => o.id === leaf.objectId);
+    const matching = (baseObj?.contours ?? []).filter((sc) =>
+      obj.contours.some((tc) => polygonsShareArea(tc.points, sc.points)),
+    );
+    if (matching.length > 0) {
+      for (const sc of matching) sources.push({ objectId: leaf.objectId, contourId: sc.id, holeId: leaf.holeId });
+    } else {
+      sources.push(leaf);
     }
   }
   next.provenance = {
@@ -447,15 +543,18 @@ function attachProvenance(obj: AnnotationObject, relation: MergeRelation, base: 
   return next;
 }
 
-function carrySourceHoles(obj: AnnotationObject, base: ImageVersion, relation: MergeRelation): AnnotationObject {
+/** 从直接来源（可能是拆分中间产物，其孔洞已经带 sourceHoleId）继承孔洞 */
+function carrySourceHoles(obj: AnnotationObject, sourceObjects: Map<string, AnnotationObject>): AnnotationObject {
   for (const contour of obj.contours) {
-    for (const sourceId of relation.sourceObjectIds) {
-      const sourceObj = base.objects.find((o) => o.id === sourceId);
-      for (const sourceContour of sourceObj?.contours ?? []) {
+    for (const sourceObj of sourceObjects.values()) {
+      for (const sourceContour of sourceObj.contours) {
         for (const hole of sourceContour.holes) {
           const inside = hole.points.every((p) => pointInPolygon(p, contour.points));
-          const already = contour.holes.some((existing) => existing.id === hole.id || eq(existing.points, hole.points));
-          if (inside && !already) contour.holes.push({ ...clone(hole), sourceHoleId: hole.id });
+          const already = contour.holes.some((existing) =>
+            existing.id === hole.id || existing.sourceHoleId === (hole.sourceHoleId ?? hole.id) || eq(existing.points, hole.points));
+          if (inside && !already) {
+            contour.holes.push({ ...clone(hole), sourceHoleId: hole.sourceHoleId ?? hole.id });
+          }
         }
       }
     }
@@ -467,40 +566,45 @@ function addSourceLevelConflicts(
   ctx: Ctx,
   relation: MergeRelation,
   targets: AnnotationObject[],
-  base: ImageVersion,
-  a: ImageVersion,
-  b: ImageVersion,
+  structuralVersion: ImageVersion,
+  sourceObjects: Map<string, AnnotationObject>,
+  otherVersion: ImageVersion,
+  pushedIds: Set<string>,
 ): void {
-  const structuralVersion = relation.side === 'a' ? a : b;
-  const otherVersion = relation.side === 'a' ? b : a;
-  for (const sourceId of relation.sourceObjectIds) {
-    const baseObj = base.objects.find((o) => o.id === sourceId);
+  const leafRoots = relation.baseSourceObjectIds ?? relation.sourceObjectIds;
+  for (const sourceId of leafRoots) {
+    const baseObj = sourceObjects.get(sourceId);
     const otherObj = otherVersion.objects.find((o) => o.id === sourceId);
     if (!baseObj || !otherObj) continue;
     const applicableTargets = targets.filter((t) =>
       t.contours.some((tc) => {
         const center = contourCenter(tc.points);
-        return baseObj.contours.some((sc) => pointInPolygon(center, sc.points));
+        return baseObj.contours.some((sc) => pointInPolygon(center, sc.points)) ||
+          t.provenance?.sources.some((s) => s.objectId === sourceId);
       }),
     );
     for (const target of applicableTargets) {
       if (otherObj.categoryId !== baseObj.categoryId) {
-        const id = 'category-source:' + relation.id + ':' + sourceId + ':' + target.id;
-        const conflict: MergeConflict = {
-          id,
-          objectId: target.id,
-          part: 'category',
-          dependsOn: relation.id,
-          sources: [{ objectId: sourceId }],
-          baseValue: baseObj.categoryId,
-          aValue: relation.side === 'a' ? target.categoryId : otherObj.categoryId,
-          bValue: relation.side === 'b' ? target.categoryId : otherObj.categoryId,
-          message: '来源物体 ' + sourceId + ' 的类别修改对应拆分/合并后的物体 ' + target.id,
-        };
-        ctx.conflicts.push(conflict);
+        // id 只绑定“来源编辑 + 最终区域”：同一编辑沿拆合链映射到同一最终区域时只问一次，
+        // 上游关系与下游关系共享同一条已映射决定
+        const id = 'category-source:' + sourceId + ':' + target.id;
+        if (!pushedIds.has(id)) {
+          pushedIds.add(id);
+          ctx.conflicts.push({
+            id,
+            objectId: target.id,
+            part: 'category',
+            dependsOn: (relation.prerequisiteRelationIds ?? [])[0] ?? relation.id,
+            sources: [{ objectId: sourceId }],
+            baseValue: baseObj.categoryId,
+            aValue: relation.side === 'a' ? target.categoryId : otherObj.categoryId,
+            bValue: relation.side === 'b' ? target.categoryId : otherObj.categoryId,
+            message: '来源物体 ' + sourceId + ' 的类别修改对应拆合后的最终区域 ' + target.id,
+          });
+        }
         const decision = ctx.resolutions[id];
-        if (!decision && ctx.strict) throw new Error('片段冲突未确认：' + conflict.message);
-        if (decision === 'disputed' && ctx.strict) throw new Error('片段冲突仍有争议：' + conflict.message);
+        if (!decision && ctx.strict) throw new Error('片段冲突未确认：' + id);
+        if (decision === 'disputed' && ctx.strict) throw new Error('片段冲突仍有争议：' + id);
         const adoptOther = decision === (relation.side === 'a' ? 'adopt-b' : 'adopt-a');
         if (adoptOther) target.categoryId = otherObj.categoryId;
       }
@@ -508,43 +612,108 @@ function addSourceLevelConflicts(
       const sourceHoles = baseObj.contours.flatMap((sc) =>
         sc.holes.map((hole) => ({ contour: sc, hole, sourceObjectId: sourceId })),
       );
-      const targetHoles = holesInsideTarget(target, sourceHoles);
-      for (const entry of targetHoles) {
-        const otherHole = otherVersion.objects
-          .find((o) => o.id === sourceId)?.contours
+      for (const entry of sourceHoles) {
+        const otherHole = otherObj.contours
           .find((c) => c.id === entry.contour.id)?.holes
           .find((h) => h.id === entry.hole.id);
-        const targetHole = target.contours
-          .flatMap((c) => c.holes)
-          .find((h) => h.id === entry.hole.id || h.points.some((p) => pointInPolygon(p, entry.hole.points)));
+        if (!otherHole) continue;
+        const hostContours = target.contours.filter((tc) =>
+          entry.hole.points.some((p) => pointInPolygon(p, tc.points)),
+        );
+        if (hostContours.length === 0) continue;
+        const targetHole = hostContours.flatMap((tc) => tc.holes).find((h) =>
+          h.id === entry.hole.id || h.sourceHoleId === (entry.hole.sourceHoleId ?? entry.hole.id));
+        const fullyInside = hostContours.some((tc) => entry.hole.points.every((p) => pointInPolygon(p, tc.points)));
         const structuralPoints = targetHole?.points ?? DELETED;
-        const otherPoints = otherHole?.points ?? DELETED;
-        if (otherHole && !eq(otherHole.points, entry.hole.points) && !eq(structuralPoints, otherPoints)) {
-          const id = 'hole-source:' + relation.id + ':' + sourceId + ':' + target.id + ':' + entry.hole.id;
-          const conflict: MergeConflict = {
-            id,
-            objectId: target.id,
-            part: 'hole',
-            contourId: entry.contour.id,
-            holeId: entry.hole.id,
-            dependsOn: relation.id,
-            sources: [{ objectId: sourceId, contourId: entry.contour.id, holeId: entry.hole.id }],
-            baseValue: entry.hole.points,
-            aValue: relation.side === 'a' ? structuralPoints : otherPoints,
-            bValue: relation.side === 'b' ? structuralPoints : otherPoints,
-            message: '来源物体 ' + sourceId + ' 的孔洞修改对应拆分/合并后的物体 ' + target.id,
-          };
-          ctx.conflicts.push(conflict);
+        const otherPoints = otherHole.points;
+        const otherChanged = !eq(otherHole.points, entry.hole.points);
+        // 该孔洞在本关系的几个最终区域上都有落点：跨拆合边界，每一侧都需决定形态
+        const rawStructuralTargets = relation.targetObjectIds
+          .map((tid) => structuralVersion.objects.find((o) => o.id === tid))
+          .filter((o): o is AnnotationObject => !!o);
+        const holeLandsOn = (t: AnnotationObject) =>
+          t.contours.some((tc) => entry.hole.points.some((p) => pointInPolygon(p, tc.points)));
+        const siblingTargets = rawStructuralTargets.filter(holeLandsOn);
+        const crosses = siblingTargets.length > 1;
+        const id = 'hole-source:' + sourceId + ':' + target.id + ':' + entry.hole.id;
+        if (otherChanged || crosses) {
+          if (!pushedIds.has(id)) {
+            pushedIds.add(id);
+            ctx.conflicts.push({
+              id,
+              objectId: target.id,
+              part: crosses ? 'hole-cross' : 'hole',
+              contourId: entry.contour.id,
+              holeId: entry.hole.id,
+              dependsOn: (relation.prerequisiteRelationIds ?? [])[0] ?? relation.id,
+              sources: [{ objectId: sourceId, contourId: entry.contour.id, holeId: entry.hole.id }],
+              baseValue: entry.hole.points,
+              aValue: relation.side === 'a' ? structuralPoints : otherPoints,
+              bValue: relation.side === 'b' ? structuralPoints : otherPoints,
+              message: crosses
+                ? '来源物体 ' + sourceId + ' 的孔洞 ' + entry.hole.id + ' 跨过拆分边界（同时落入 ' + siblingTargets.map((t) => t.id).join('、') + '），需要决定最终区域 ' + target.id + ' 上的孔洞形态'
+                : '来源物体 ' + sourceId + ' 的孔洞修改对应拆合后的最终区域 ' + target.id,
+            });
+          }
           const decision = ctx.resolutions[id];
-          if (!decision && ctx.strict) throw new Error('片段冲突未确认：' + conflict.message);
-          if (decision === 'disputed' && ctx.strict) throw new Error('片段冲突仍有争议：' + conflict.message);
+          if (!decision && ctx.strict) throw new Error('片段冲突未确认：' + id);
+          if (decision === 'disputed' && ctx.strict) throw new Error('片段冲突仍有争议：' + id);
           const adoptOther = decision === (relation.side === 'a' ? 'adopt-b' : 'adopt-a');
-          if (adoptOther) {
-            for (const c of target.contours) {
-              const idx = c.holes.findIndex((h) => h.id === entry.hole.id);
-              if (idx >= 0) c.holes[idx] = { ...otherHole, sourceHoleId: entry.hole.id };
+          if (adoptOther && otherChanged) {
+            for (const tc of hostContours) {
+              const idx = tc.holes.findIndex((h) => h.id === entry.hole.id || h.sourceHoleId === (entry.hole.sourceHoleId ?? entry.hole.id));
+              if (idx >= 0) tc.holes[idx] = { ...otherHole, sourceHoleId: entry.hole.sourceHoleId ?? entry.hole.id };
             }
           }
+        }
+      }
+    }
+    // 跨拆合边界的孔洞：即使某个最终区域不再“包含”原孔，只要有孔点落在其中就必须让用户决定形态
+    for (const entry of baseObj.contours.flatMap((sc) => sc.holes.map((hole) => ({ contour: sc, hole })))) {
+      const otherHole = otherObj.contours
+        .find((c) => c.id === entry.contour.id)?.holes
+        .find((h) => h.id === entry.hole.id);
+      if (!otherHole) continue;
+      const rawTargets = relation.targetObjectIds
+        .map((tid) => structuralVersion.objects.find((o) => o.id === tid))
+        .filter((o): o is AnnotationObject => !!o);
+      const geometryHole = otherHole;
+      const landed = rawTargets.filter((rt) =>
+        rt.contours.some((tc) => geometryHole.points.some((p) => pointInPolygon(p, tc.points))),
+      );
+      if (landed.length <= 1) continue;
+      for (const raw of landed) {
+        const target = targets.find((t) => t.id === raw.id);
+        if (!target) continue;
+        const id = 'hole-source:' + sourceId + ':' + target.id + ':' + entry.hole.id;
+        const already = pushedIds.has(id);
+        pushedIds.add(id);
+        const existing = ctx.conflicts.find((c) => c.id === id);
+        if (existing) existing.part = 'hole-cross';
+        const hostContours = target.contours.filter((tc) =>
+          entry.hole.points.some((p) => pointInPolygon(p, tc.points)),
+        );
+        if (!existing) {
+          ctx.conflicts.push({
+            id,
+            objectId: target.id,
+            part: 'hole-cross',
+            contourId: entry.contour.id,
+            holeId: entry.hole.id,
+            dependsOn: (relation.prerequisiteRelationIds ?? [])[0] ?? relation.id,
+            sources: [{ objectId: sourceId, contourId: entry.contour.id, holeId: entry.hole.id }],
+            baseValue: entry.hole.points,
+            aValue: relation.side === 'a' ? DELETED : otherHole.points,
+            bValue: relation.side === 'b' ? DELETED : otherHole.points,
+            message: '来源物体 ' + sourceId + ' 的孔洞 ' + entry.hole.id + ' 跨过拆分边界（同时落入 ' + landed.map((t) => t.id).join('、') + '），需要决定最终区域 ' + target.id + ' 上的孔洞形态',
+          });
+        }
+        const decision = ctx.resolutions[id];
+        if (!decision && ctx.strict) throw new Error('片段冲突未确认：' + id);
+        if (decision === 'disputed' && ctx.strict) throw new Error('片段冲突仍有争议：' + id);
+        const adoptOther = decision === (relation.side === 'a' ? 'adopt-b' : 'adopt-a');
+        if (adoptOther && (!already || existing?.part === 'hole-cross')) {
+          for (const tc of hostContours) tc.holes.push({ ...otherHole, sourceHoleId: entry.hole.sourceHoleId ?? entry.hole.id });
         }
       }
     }
@@ -562,68 +731,127 @@ function runRelationMerge(
   const legacyCtx: Ctx = { conflicts: [], resolutions: {}, strict: false };
   const byIdResult = mergeByIds(legacyCtx, base, a, b);
   const outputs = new Map(byIdResult.objects.map((o) => [o.id, o]));
-  const handled = new Set<string>();
-  const provisionalTargets = new Map<string, AnnotationObject[]>();
+  const baseIds = new Set(base.objects.map((o) => o.id));
+  const bySide = {
+    a: new Map(a.objects.map((o) => [o.id, o])),
+    b: new Map(b.objects.map((o) => [o.id, o])),
+  };
+  // 已经生成的中间/最终结构物体，供下游关系拍平来源链
+  const produced = new Map<string, AnnotationObject>();
+  const baseById = new Map(base.objects.map((o) => [o.id, o]));
+  const pushedConflictIds = new Set<string>();
 
-  for (const relation of relations) {
-    if (relationDecisions[relation.id] === 'rejected') continue;
-    const structuralVersion = relation.side === 'a' ? a : b;
-    const targets = relation.targetObjectIds
-      .map((id) => structuralVersion.objects.find((o) => o.id === id))
-      .filter((o): o is AnnotationObject => !!o)
-      .map((o) => carrySourceHoles(attachProvenance(o, relation, base), base, relation));
-    provisionalTargets.set(relation.id, targets);
-    addSourceLevelConflicts(ctx, relation, targets, base, a, b);
-  }
+  // 拓扑排序：先做被依赖的上游拆分，再做引用其产物的合并；同层按 id 稳定排序
+  const relationById = new Map(relations.map((r) => [r.id, r]));
+  const order: MergeRelation[] = [];
+  const visiting = new Set<string>();
+  const visit = (relation: MergeRelation) => {
+    if (order.includes(relation) || visiting.has(relation.id)) return;
+    visiting.add(relation.id);
+    for (const prereqId of relation.prerequisiteRelationIds ?? []) {
+      const prereq = relationById.get(prereqId);
+      if (prereq) visit(prereq);
+    }
+    visiting.delete(relation.id);
+    order.push(relation);
+  };
+  [...relations].sort((x, y) => x.id.localeCompare(y.id)).forEach(visit);
 
-  for (const relation of relations) {
+  // 先落地所有非确认关系对基线物体的保留；确认关系随后按拓扑顺序移除/替换它们消费的来源，
+  // 避免已确认拆分的根物体被“未决定”分支又当作原样保留导出
+  for (const relation of order) {
     const decision = relationDecisions[relation.id];
-    if (decision === 'disputed' && ctx.strict) throw new Error('拆合关系仍有争议：' + relation.message);
-    if (!decision && ctx.strict) throw new Error('拆合关系未确认：' + relation.message);
-    if (decision === 'rejected') {
-      const keepVersion = relation.side === 'a' ? b : a;
-      for (const sourceId of relation.sourceObjectIds) {
-        const kept = keepVersion.objects.find((o) => o.id === sourceId);
+    if (decision === 'confirmed') continue;
+    const otherById = relation.side === 'a' ? bySide.b : bySide.a;
+    for (const sourceId of relation.sourceObjectIds) {
+      if (baseIds.has(sourceId)) {
+        const kept = otherById.get(sourceId) ?? baseById.get(sourceId);
         if (kept) outputs.set(sourceId, finalizeObject(kept));
       }
-      for (const targetId of relation.targetObjectIds) outputs.delete(targetId);
+    }
+    for (const targetId of relation.targetObjectIds) {
+      outputs.delete(targetId);
+      produced.delete(targetId);
+    }
+  }
+
+  for (const relation of order) {
+    const decision = relationDecisions[relation.id];
+    const structural = relation.side === 'a' ? bySide.a : bySide.b;
+    const otherById = relation.side === 'a' ? bySide.b : bySide.a;
+    const otherVersion = relation.side === 'a' ? b : a;
+
+    if (decision === 'rejected') {
+      // 舍弃结构的恢复已在上方统一完成；这里不再落地任何结构产物
       continue;
     }
+
+    // 无论确认与否，都生成带 provenance 的临时结果用于派生片段冲突（允许只确认部分后保存继续）
+    const available = new Map<string, AnnotationObject>([
+      ...baseById,
+      ...produced,
+      ...[...structural].filter(([id]) => !baseIds.has(id)),
+    ]);
+    const targets = relation.targetObjectIds
+      .map((id) => structural.get(id))
+      .filter((o): o is AnnotationObject => !!o)
+      .map((o) => {
+        const withProv = attachProvenance(o, relation, available, base);
+        const directSources = new Map<string, AnnotationObject>();
+        for (const sourceId of relation.sourceObjectIds) {
+          const src = produced.get(sourceId) ?? baseById.get(sourceId);
+          if (src) directSources.set(sourceId, src);
+        }
+        return carrySourceHoles(withProv, directSources);
+      });
+    addSourceLevelConflicts(ctx, relation, targets, (relation.side === 'a' ? a : b), available, otherVersion, pushedConflictIds);
+
+    if (decision === 'disputed' && ctx.strict) throw new Error('拆合关系仍有争议：' + relation.message);
+    if (!decision && ctx.strict) throw new Error('拆合关系未确认：' + relation.message);
     if (decision !== 'confirmed') continue;
 
-    const targets = provisionalTargets.get(relation.id) ?? [];
     for (const id of [...relation.sourceObjectIds, ...relation.targetObjectIds]) {
-      handled.add(id);
       outputs.delete(id);
     }
-    for (const target of targets) outputs.set(target.id, target);
+    for (const target of targets) {
+      outputs.set(target.id, target);
+      produced.set(target.id, target);
+    }
+    // 已被确认关系消费的基线物体：避免中间来源再次导出
+    for (const rootId of relation.baseSourceObjectIds ?? relation.sourceObjectIds) outputs.delete(rootId);
   }
 
   const finalObjects = [...outputs.values()];
   const removedObjects = new Set<string>();
+  const dupSeen = new Set<string>();
   for (let i = 0; i < finalObjects.length; i++) {
     for (let j = i + 1; j < finalObjects.length; j++) {
       const x = finalObjects[i];
       const y = finalObjects[j];
-      const sharedSource = (x.provenance?.sources ?? []).some((sx) =>
-        y.provenance?.sources.some((sy) => sy.objectId === sx.objectId),
-      );
       const overlaps = x.contours.some((cx) => y.contours.some((cy) => polygonsShareArea(cx.points, cy.points)));
-      if (sharedSource && overlaps) {
+      const xSources = new Set((x.provenance?.sources ?? [{ objectId: x.id }]).map((s) => s.objectId));
+      const ySources = new Set((y.provenance?.sources ?? [{ objectId: y.id }]).map((s) => s.objectId));
+      const sharedSource = [...xSources].some((id) => ySources.has(id));
+      // 同一来源被多次引用、或一边结构一边原样保留：歧义必须交给用户，半成品不能重复导出
+      if (overlaps && (sharedSource || xSources.has(y.id) || ySources.has(x.id))) {
         const id = 'duplicate-region:' + [x.id, y.id].sort().join(':');
-        ctx.conflicts.push({
-          id,
-          objectId: x.id,
-          part: 'duplicate-region',
-          baseValue: x.provenance?.sources ?? [],
-          aValue: x.id,
-          bValue: y.id,
-          message: '物体 ' + x.id + ' 与 ' + y.id + ' 重复覆盖同一来源区域，需要调整拆分或舍弃其一',
-        });
+        if (!dupSeen.has(id)) {
+          dupSeen.add(id);
+          ctx.conflicts.push({
+            id,
+            objectId: x.id,
+            part: 'duplicate-region',
+            baseValue: [...xSources, ...ySources],
+            aValue: x.id,
+            bValue: y.id,
+            message: '物体 ' + x.id + ' 与 ' + y.id + ' 重复覆盖同一来源区域，歧义保留：请舍弃其一或回去调整拆合关系',
+          });
+        }
         const duplicateChoice = ctx.resolutions[id];
         if (!duplicateChoice && ctx.strict) throw new Error('来源区域被重复导出：' + x.id + ', ' + y.id);
         if (duplicateChoice === 'adopt-b') removedObjects.add(x.id);
-        else if (duplicateChoice) removedObjects.add(y.id);
+        else if (duplicateChoice === 'adopt-a') removedObjects.add(y.id);
+        // discard/disputed 不能消歧：strict 下上面已抛出，预览时两者都保留并提示
       }
     }
   }

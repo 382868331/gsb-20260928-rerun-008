@@ -1,8 +1,38 @@
-import { useMemo, useState } from 'react';
-import { GitMerge, Undo2, X } from 'lucide-react';
+import { Component, useMemo, useState, type ReactNode } from 'react';
+import { ChevronRight, GitMerge, Save, Undo2, X } from 'lucide-react';
 import { useStore } from '../store';
-import { planMerge } from '../core/merge';
-import type { Category, ImageRecord, MergeConflict, MergeRelationDecision, MergeResolution } from '../types';
+import { planMerge, type MergePlan } from '../core/merge';
+import type {
+  Category,
+  ImageRecord,
+  MergeConflict,
+  MergeRelation,
+  MergeRelationDecision,
+  MergeResolution,
+} from '../types';
+
+class PanelBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null as Error | null };
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="merge-panel">
+          <h3><GitMerge size={15} /> 合并面板出现渲染问题</h3>
+          <p className="error">{this.state.error.message}</p>
+          <p className="muted">
+            已确认的决定与原修订都没有丢失：刷新页面或重新进入该图片即可继续。合并未完成前不会生成任何新提交。
+          </p>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const FRAGMENT_PARTS = new Set(['category', 'outline', 'hole', 'hole-cross', 'duplicate-region', 'hole-existence']);
 
 function isPoints(v: unknown): v is { x: number; y: number }[] {
   return Array.isArray(v) && v.every((p) => p && typeof p === 'object' && 'x' in p);
@@ -49,6 +79,7 @@ function ConflictRow({
   categories,
   relationChoice,
   fragmentLocked,
+  chain,
   onPick,
   onRelation,
   onUndo,
@@ -58,14 +89,30 @@ function ConflictRow({
   categories: Category[];
   relationChoice?: MergeRelationDecision;
   fragmentLocked?: boolean;
+  chain?: MergeRelation[];
   onPick: (c: MergeResolution) => void;
   onRelation: (c: MergeRelationDecision) => void;
   onUndo: () => void;
 }) {
-  const isRelation = conflict.part === 'split-relation' || conflict.part === 'merge-relation' || conflict.part === 'hole-promotion';
+  const isRelation = !FRAGMENT_PARTS.has(conflict.part);
+  const sourceIds = [...new Set((conflict.sources ?? []).map((s) => s.objectId))];
   return (
     <li className={'conflict' + (choice ? ' resolved' : '')}>
       <p className="conflict-msg">{conflict.message}</p>
+      {chain && chain.length > 0 && (
+        <p className="conflict-chain" title="沿多次拆合追溯到的基线来源">
+          {chain.map((rel, i) => (
+            <span key={rel.id} className="chain-step">
+              {i > 0 && <ChevronRight size={11} />}
+              {rel.kind === 'split' ? '拆分' : rel.kind === 'merge' ? '合并' : '孔洞提升'}
+              ：{rel.sourceObjectIds.join('、')} → {rel.targetObjectIds.join('、')}
+            </span>
+          ))}
+        </p>
+      )}
+      {sourceIds.length > 0 && (
+        <p className="conflict-sources muted">最终区域来源（基线物体）：{sourceIds.join('、')}</p>
+      )}
       <div className="conflict-values">
         <div className="val-col">
           <em>基线</em>
@@ -132,18 +179,50 @@ export function MergePanel({ image }: { image: ImageRecord }) {
   const [aVer, setAVer] = useState<number | ''>('');
   const [bVer, setBVer] = useState<number | ''>('');
   const [error, setError] = useState<string | null>(null);
+  // 退出候选：只影响界面展示，决定仍保留在会话中，随时可再次进入
+  const [exited, setExited] = useState(false);
 
-  const conflicts = useMemo(() => {
-    if (!session) return [];
-    try {
-      return planMerge(image, session.aVersion, session.bVersion).conflicts;
-    } catch {
-      return [];
-    }
+  const plan: MergePlan | null = useMemo(() => {
+    if (!session) return null;
+    return planMerge(image, session.aVersion, session.bVersion);
   }, [image, session]);
+  const conflicts = plan?.conflicts ?? [];
+  const relations = plan?.relations ?? [];
+  const relationById = useMemo(() => new Map(relations.map((rel) => [rel.id, rel])), [relations]);
 
-  if (!session) {
-    return (
+  const isRelationConflict = (c: MergeConflict) => c.id.startsWith('conflict:relation:');
+  const relationIdOf = (c: MergeConflict) => c.id.slice('conflict:'.length);
+  const statusOf = (c: MergeConflict) =>
+    isRelationConflict(c)
+      ? session?.relations?.[relationIdOf(c)]
+      : session?.resolutions[c.id];
+  const done = session ? conflicts.filter((c) => statusOf(c)).length : 0;
+  const allDone = conflicts.length > 0 && conflicts.length === done;
+  // 沿 prerequisiteRelationIds 拼出多次拆合的来源链
+  const chainOf = (c: MergeConflict): MergeRelation[] => {
+    if (!c.dependsOn) return [];
+    const chain: MergeRelation[] = [];
+    let current = relationById.get(c.dependsOn);
+    const guard = new Set<string>();
+    while (current && !guard.has(current.id)) {
+      guard.add(current.id);
+      chain.unshift(current);
+      const prereqId = current.prerequisiteRelationIds?.[0];
+      current = prereqId ? relationById.get(prereqId) : undefined;
+    }
+    return chain;
+  };
+
+  const handleComplete = () => {
+    try {
+      completeMerge();
+      setExited(false);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const setupView = (
       <div className="merge-panel">
         <h3>
           <GitMerge size={15} /> 合并两条修订
@@ -194,33 +273,45 @@ export function MergePanel({ image }: { image: ImageRecord }) {
           </div>
         )}
       </div>
+  );
+
+  if (!session || exited) {
+    return (
+      <PanelBoundary>
+        {session && (
+          <div className="merge-panel merge-resume">
+            <h3><GitMerge size={15} /> 合并进行中</h3>
+            <p className="muted">
+              v{session.aVersion} 与 v{session.bVersion}（基线 v{session.baseVersion}）：已确认 {done}/{conflicts.length} 处。
+              原修订与已作决定均保留，合并未完成前不会生成新提交。
+            </p>
+            <div className="merge-actions">
+              <button className="primary" onClick={() => { setExited(false); setError(null); }}>
+                <GitMerge size={14} /> 再次进入合并
+              </button>
+              <button
+                onClick={() => confirm('放弃本次合并？已做的确认将丢失，原修订与冻结提交不受影响。') && cancelMerge()}
+              >
+                <X size={14} /> 放弃合并
+              </button>
+            </div>
+          </div>
+        )}
+        {!session && setupView}
+      </PanelBoundary>
     );
   }
 
-  const relationById = useMemo(() => {
-    if (!session) return new Map<string, MergeRelationDecision>();
-    try {
-      return new Map(planMerge(image, session.aVersion, session.bVersion).relations.map((r) => [r.id, session.relations?.[r.id]]).filter((x): x is [string, MergeRelationDecision] => !!x[1]));
-    } catch {
-      return new Map();
-    }
-  }, [image, session]);
-  const isRelationConflict = (c: MergeConflict) => c.id.startsWith('conflict:relation:');
-  const statusOf = (c: MergeConflict) =>
-    isRelationConflict(c)
-      ? session.relations?.[c.id.slice('conflict:'.length)]
-      : session.resolutions[c.id];
-  const done = conflicts.filter((c) => statusOf(c)).length;
-  const allDone = conflicts.length === done;
   return (
+    <PanelBoundary>
     <div className="merge-panel">
       <h3>
         <GitMerge size={15} /> 合并 v{session.aVersion} 与 v{session.bVersion}（基线 v
         {session.baseVersion}）
       </h3>
       <p className="muted">
-        互不冲突的修改已自动保留；{conflicts.length} 处冲突待确认，已确认 {done}/
-        {conflicts.length}。进度已自动保存，可随时离开后继续。
+        互不冲突的修改已自动保留；{conflicts.length} 处待处理，已决定 {done}/{conflicts.length}。
+        可只确认来源链的一部分后保存退出，之后再次进入继续；合并完成前不会产生新提交，原修订始终可追溯。
       </p>
       {conflicts.length > 0 && (
         <ul className="conflict-list">
@@ -229,29 +320,35 @@ export function MergePanel({ image }: { image: ImageRecord }) {
               key={c.id}
               conflict={c}
               choice={statusOf(c)}
-              relationChoice={relationById.get(c.id.slice('conflict:'.length))}
+              relationChoice={session.relations?.[relationIdOf(c)] as MergeRelationDecision | undefined}
               fragmentLocked={!!c.dependsOn && session.relations?.[c.dependsOn] !== 'confirmed'}
+              chain={chainOf(c)}
               categories={categories}
-              onPick={(choice) => resolveConflict(c.id, choice)}
-              onRelation={(decision) => resolveRelation(c.id.slice('conflict:'.length), decision)}
+              onPick={(choice) => { resolveConflict(c.id, choice); setError(null); }}
+              onRelation={(decision) => { resolveRelation(relationIdOf(c), decision); setError(null); }}
               onUndo={() => unresolveConflict(c.id)}
             />
           ))}
         </ul>
       )}
+      {error && <p className="error">{error}</p>}
       <div className="merge-actions">
         <button
           className="primary"
           disabled={!allDone}
-          title={allDone ? '生成新的合并提交' : '还有冲突未确认'}
-          onClick={() => completeMerge()}
+          title={allDone ? '生成新的合并提交' : '还有冲突未确认，可先保存退出稍后继续'}
+          onClick={handleComplete}
         >
           <GitMerge size={14} /> 完成合并（生成新提交，历史版本不变）
         </button>
-        <button onClick={() => confirm('放弃本次合并？已做的确认将丢失。') && cancelMerge()}>
+        <button onClick={() => setExited(true)} title="保存已作决定并退出候选，随时可再次进入">
+          <Save size={14} /> 保存并退出候选
+        </button>
+        <button onClick={() => confirm('放弃本次合并？已做的确认将丢失，原修订与冻结提交不受影响。') && cancelMerge()}>
           <X size={14} /> 放弃合并
         </button>
       </div>
     </div>
+    </PanelBoundary>
   );
 }
