@@ -5,13 +5,18 @@ import type {
   ImageVersion,
   ImportIssue,
   ImportResult,
+  MergeSession,
   ProjectData,
 } from '../types';
 import { validateVersion } from './validation';
 import { createImage, nowIso } from './versioning';
 
 /** 导出：仅包含已提交版本，草稿不导出 */
-export function exportProject(images: ImageRecord[], categories: Category[]): ProjectData {
+export function exportProject(
+  images: ImageRecord[],
+  categories: Category[],
+  mergeSessions: MergeSession[] = [],
+): ProjectData {
   return {
     version: 1,
     exportedAt: nowIso(),
@@ -26,7 +31,19 @@ export function exportProject(images: ImageRecord[], categories: Category[]): Pr
         submittedVersions: image.versions.filter((v) => v.status === 'submitted'),
       }))
       .filter((e) => e.submittedVersions.length > 0),
+    mergeSessions: structuredMergeSessions(images, mergeSessions),
   };
+}
+
+function structuredMergeSessions(images: ImageRecord[], sessions: MergeSession[]): MergeSession[] {
+  return sessions
+    .filter((session) => {
+      const image = images.find((item) => item.id === session.imageId);
+      if (!image) return false;
+      const submitted = new Set(image.versions.filter((v) => v.status === 'submitted').map((v) => v.version));
+      return [session.baseVersion, session.aVersion, session.bVersion].every((version) => submitted.has(version));
+    })
+    .map((session) => structuredClone(session));
 }
 
 export function serializeProject(data: ProjectData): string {
@@ -47,6 +64,20 @@ function isValidVersion(v: unknown): v is ImageVersion {
   );
 }
 
+function isValidSession(v: unknown): v is MergeSession {
+  if (typeof v !== 'object' || v === null) return false;
+  const rec = v as Record<string, unknown>;
+  return (
+    typeof rec.id === 'string' &&
+    typeof rec.imageId === 'string' &&
+    Number.isInteger(rec.baseVersion) &&
+    Number.isInteger(rec.aVersion) &&
+    Number.isInteger(rec.bVersion) &&
+    typeof rec.resolutions === 'object' && rec.resolutions !== null &&
+    typeof rec.relations === 'object' && rec.relations !== null
+  );
+}
+
 export interface ImportOptions {
   /** 与导入文件 id 匹配的现有图片，可用于补回缺失的图片数据 */
   existingImages: ImageRecord[];
@@ -62,7 +93,7 @@ export interface ImportOptions {
 export function importProject(
   raw: string, 
   options: ImportOptions,
-): { result: ImportResult; images: ImageRecord[]; categories: Category[] } {
+): { result: ImportResult; images: ImageRecord[]; categories: Category[]; mergeSessions: MergeSession[] } {
   const issues: ImportIssue[] = [];
   const accepted: string[] = [];
   const rejected: string[] = [];
@@ -85,6 +116,7 @@ export function importProject(
       },
       images: options.existingImages,
       categories: options.existingCategories,
+      mergeSessions: [],
     };
   }
 
@@ -98,6 +130,7 @@ export function importProject(
       },
       images: options.existingImages,
       categories: options.existingCategories,
+      mergeSessions: [],
     };
   }
 
@@ -111,6 +144,7 @@ export function importProject(
   const categories = [...categoryMap.values()];
 
   root.images.forEach((entry, index) => processOneImage(entry, index));
+  const importedSessions: MergeSession[] = [];
 
   function processOneImage(entry: unknown, index: number): void {
     const loc = (over: ImportIssue): ImportIssue => ({
@@ -214,6 +248,16 @@ export function importProject(
     accepted.push(id);
   }
 
+  for (const session of Array.isArray(root.mergeSessions) ? root.mergeSessions : []) {
+    if (!isValidSession(session)) continue;
+    const image = imagesById.get(session.imageId);
+    if (!image) continue;
+    const numbers = new Set(image.versions.filter((v) => v.status === 'submitted').map((v) => v.version));
+    if (![session.baseVersion, session.aVersion, session.bVersion].every((version) => numbers.has(version))) continue;
+    if (options.existingImages.length === 0 && !accepted.includes(session.imageId)) continue;
+    importedSessions.push(structuredClone(session));
+  }
+
   // 防御：若本地某张图只有草稿且被导入数据关联，保持草稿不动
   return {
     result: { accepted, rejected, issues },
@@ -221,6 +265,7 @@ export function importProject(
       options.existingImages.some((e) => e.id === img.id) || accepted.includes(img.id),
     ),
     categories,
+    mergeSessions: importedSessions,
   };
 }
 

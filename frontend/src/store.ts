@@ -189,13 +189,23 @@ export const useStore = create<AppState>()(
 
       exportJson: () => {
         const { images, categories } = get();
-        return JSON.stringify(exportProject(images, categories));
+        return JSON.stringify(exportProject(images, categories, get().mergeSessions));
       },
 
       importJson: (raw) => {
-        const { images, categories } = get();
+        const { images, categories, mergeSessions } = get();
         const out = importProject(raw, { existingImages: images, existingCategories: categories });
-        set({ images: out.images, categories: out.categories, lastImport: out.result });
+        const updatedImageIds = new Set(out.result.accepted);
+        const importedSessionIds = new Set(out.mergeSessions.map((session) => session.id));
+        const retainedSessions = mergeSessions.filter((session) =>
+          !importedSessionIds.has(session.id) && !updatedImageIds.has(session.imageId),
+        );
+        set({
+          images: out.images,
+          categories: out.categories,
+          mergeSessions: [...retainedSessions, ...out.mergeSessions],
+          lastImport: out.result,
+        });
         return out.result;
       },
 
@@ -233,15 +243,30 @@ export const useStore = create<AppState>()(
             const relationId = conflictId.startsWith('conflict:relation:')
               ? conflictId.slice('conflict:'.length)
               : null;
-            if (relationId) delete relations[relationId];
             // 只有撤回拆合关系时才级联重开真正依赖它的片段决定；
             // 撤回普通片段决定不影响其他区域已作出的选择
-            if (relationId) {
+            if (relationId && image) {
+              const planRelations = planMerge(image, m.aVersion, m.bVersion).relations;
+              const reopenedRelations = new Set<string>([relationId]);
+              let changed = true;
+              while (changed) {
+                changed = false;
+                const reopenedTargetIds = new Set(planRelations
+                  .filter((relation) => reopenedRelations.has(relation.id))
+                  .flatMap((relation) => relation.targetObjectIds));
+                for (const relation of planRelations) {
+                  if (!reopenedRelations.has(relation.id) && relation.sourceObjectIds.some((id) => reopenedTargetIds.has(id))) {
+                    reopenedRelations.add(relation.id);
+                    changed = true;
+                  }
+                }
+              }
               for (const conflict of planConflicts) {
-                if (conflict.dependsOn === relationId) {
+                if (conflict.dependsOn && reopenedRelations.has(conflict.dependsOn)) {
                   delete resolutions[conflict.id];
                 }
               }
+              for (const id of reopenedRelations) delete relations[id];
             }
             return { ...m, resolutions, relations, updatedAt: nowIso() };
           }),

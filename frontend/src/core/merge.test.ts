@@ -15,6 +15,7 @@ import {
   updateDraftObject,
 } from './versioning';
 import { exportProject } from './exchange';
+import { importProject } from './exchange';
 import type { AnnotationObject, ImageRecord, MergeSession } from '../types';
 
 const cats = defaultCategories();
@@ -160,11 +161,61 @@ describe('merge', () => {
     expect(last.mergeOf).toEqual({ base: 1, a: 2, b: 3 });
   });
 
-  it('rejects revisions from different bases', () => {
+  it('rejects ancestor-descendant pairs', () => {
     const { img: base } = baseImage();
     let img = revise(base, 1, () => {});
     img = revise(img, 2, () => {}); // v3 基于 v2，而 v2 基于 v1
-    expect(() => resolveMergeBase(img, 2, 3)).toThrow(/同一版本/);
+    expect(() => resolveMergeBase(img, 2, 3)).toThrow(/祖先|后代/);
+  });
+
+  it('resolves a merge across multi-generation branches from their common ancestor', () => {
+    const { img: root, obj1, obj2 } = baseImage();
+    let img = revise(root, 1, (objs) => {
+      const i = objs.findIndex((o) => o.id === obj1);
+      const createdAt = new Date().toISOString();
+      objs.splice(i, 1, {
+        id: 'split-left', categoryId: cats[0].id, createdAt, updatedAt: createdAt,
+        contours: [createContour([{ x: 10, y: 10 }, { x: 70, y: 10 }, { x: 70, y: 90 }, { x: 10, y: 90 }])],
+      }, {
+        id: 'split-right', categoryId: cats[0].id, createdAt, updatedAt: createdAt,
+        contours: [createContour([{ x: 70, y: 10 }, { x: 90, y: 10 }, { x: 90, y: 90 }, { x: 70, y: 90 }])],
+      });
+    });
+    img = revise(img, 2, (objs) => {
+      const createdAt = new Date().toISOString();
+      objs.splice(0, objs.length, objs.find((o) => o.id === 'split-left')!, {
+        id: 'merged-obj', categoryId: cats[1].id, createdAt, updatedAt: createdAt,
+        contours: [createContour([{ x: 70, y: 10 }, { x: 190, y: 10 }, { x: 190, y: 190 }, { x: 70, y: 190 }])],
+      });
+    });
+    img = revise(img, 1, (objs) => {
+      const obj = objs.find((o) => o.id === obj1)!;
+      obj.categoryId = cats[2].id;
+      obj.contours[0].holes[0].points[0] = { x: 35, y: 35 };
+    });
+    expect(resolveMergeBase(img, 3, 4)).toBe(1);
+    const plan = planMerge(img, 3, 4);
+    const relations = plan.relations.filter((r) => r.side === 'a');
+    expect(relations.map((r) => [r.fromVersion, r.toVersion, r.kind])).toEqual([
+      [1, 2, 'split'],
+      [2, 3, 'merge'],
+    ]);
+    expect(relations[1].rootSourceObjectIds?.sort()).toEqual([obj1, obj2].sort());
+    const session = createMergeSession(img, 3, 4);
+    for (const relation of plan.relations) session.relations[relation.id] = 'confirmed';
+    for (const conflict of planMerge(img, 3, 4).conflicts.filter((c) => c.dependsOn)) {
+      session.resolutions[conflict.id] = 'adopt-b';
+    }
+    const v = merged(img, session);
+    expect(v.mergeOf).toEqual({ base: 1, a: 3, b: 4 });
+    expect(v.objects.map((o) => o.id).sort()).toEqual(['merged-obj', 'split-left']);
+    const big = v.objects.find((o) => o.id === 'merged-obj')!;
+    expect(big.provenance?.sources.map((s) => s.objectId).sort()).toEqual([obj1, obj2].sort());
+    expect(v.objects.find((o) => o.id === 'split-left')!.categoryId).toBe(cats[2].id);
+    expect(big.categoryId).toBe(cats[2].id);
+    expect(v.objects.find((o) => o.id === 'split-left')!.contours[0].holes[0].points[0]).toEqual({ x: 35, y: 35 });
+    expect(big.contours[0].holes).toEqual([]);
+    expect(Object.keys(session.resolutions).some((id) => id.includes('split-right'))).toBe(false);
   });
 
   it('merges holes added on one side and removed on the other independently', () => {
@@ -313,5 +364,31 @@ describe('merge', () => {
     // 原修订与合并审计均可追溯
     expect(v.mergeOf).toEqual({ base: 1, a: 2, b: 3 });
     expect(img.versions.map((version) => version.version)).toEqual([1, 2, 3]);
+  });
+
+  it('continues a partially resolved merge after export and reimport', () => {
+    const { img: base, obj1, obj2 } = baseImage();
+    let img = revise(base, 1, (objs) => {
+      objs.find((o) => o.id === obj1)!.categoryId = cats[2].id;
+      objs.find((o) => o.id === obj2)!.categoryId = cats[0].id;
+    });
+    img = revise(img, 1, (objs) => {
+      objs.find((o) => o.id === obj1)!.categoryId = cats[1].id;
+      objs.find((o) => o.id === obj2)!.categoryId = cats[2].id;
+    });
+    const session = createMergeSession(img, 2, 3);
+    session.resolutions['category:' + obj1] = 'a';
+    const data = exportProject([img], cats, [session]);
+    const imported = importProject(JSON.stringify(data), {
+      existingImages: [structuredClone(base)],
+      existingCategories: cats,
+    });
+    const restored = imported.mergeSessions[0];
+    expect(imported.result.issues).toEqual([]);
+    expect(imported.images[0].versions.map((version) => version.version)).toEqual([1, 2, 3]);
+    expect(restored.baseVersion).toBe(1);
+    expect(restored.resolutions['category:' + obj1]).toBe('a');
+    const restoredImage = imported.images[0];
+    expect(planMerge(restoredImage, restored.aVersion, restored.bVersion).conflicts).toHaveLength(2);
   });
 });

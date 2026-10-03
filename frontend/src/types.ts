@@ -69,6 +69,11 @@ export interface MergeRelation {
   side: 'a' | 'b';
   targetObjectIds: string[];
   sourceObjectIds: string[];
+  /** 沿多代来源链折叠到共同祖先后的来源物体 id */
+  rootSourceObjectIds?: string[];
+  /** 该关系发生在哪两个相邻版本之间 */
+  fromVersion?: number;
+  toVersion?: number;
   sourceContourIds?: string[];
   sourceHoleIds?: string[];
   message: string;
@@ -167,6 +172,8 @@ export interface ProjectData {
   exportedAt: string;
   images: ExportedImage[];
   categories: Category[];
+  /** 尚未完成的合并会话；导入后可继续裁决 */
+  mergeSessions?: MergeSession[];
 }
 
 export interface ExportedImage {

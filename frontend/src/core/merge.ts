@@ -292,7 +292,15 @@ function relationKey(parts: string[]): string {
   return [...new Set(parts)].sort().join('+');
 }
 
-function detectSideRelations(side: 'a' | 'b', base: ImageVersion, revised: ImageVersion): MergeRelation[] {
+function relationId(kind: string, side: 'a' | 'b', key: string): string {
+  return 'relation:' + kind + ':' + side + ':' + key;
+}
+
+function detectSideRelations(
+  side: 'a' | 'b',
+  base: ImageVersion,
+  revised: ImageVersion,
+): MergeRelation[] {
   const revisedById = new Map(revised.objects.map((o) => [o.id, o]));
   const out: MergeRelation[] = [];
 
@@ -302,13 +310,16 @@ function detectSideRelations(side: 'a' | 'b', base: ImageVersion, revised: Image
     );
     const newTargets = targets.filter((t) => !base.objects.some((b) => b.id === t.id));
     if (newTargets.length > 1) {
-      const id = 'relation:split:' + side + ':' + source.id + ':' + relationKey(newTargets.map((t) => t.id));
+      const id = relationId('split', side, source.id + ':' + relationKey(newTargets.map((t) => t.id)));
       if (!out.some((r) => r.id === id)) {
         out.push({
           id,
           kind: 'split',
           side,
           sourceObjectIds: [source.id],
+          rootSourceObjectIds: [source.id],
+          fromVersion: base.version,
+          toVersion: revised.version,
           targetObjectIds: newTargets.map((t) => t.id),
           message: '修订 ' + side.toUpperCase() + ' 将物体 ' + source.id + ' 拆分为 ' + newTargets.length + ' 个物体',
         });
@@ -326,10 +337,13 @@ function detectSideRelations(side: 'a' | 'b', base: ImageVersion, revised: Image
         );
         if (promoted.length > 0) {
           out.push({
-            id: 'relation:hole-promotion:' + side + ':' + source.id + ':' + sc.id + ':' + hole.id,
+            id: relationId('hole-promotion', side, source.id + ':' + sc.id + ':' + hole.id),
             kind: 'hole-to-outline',
             side,
             sourceObjectIds: [source.id],
+            rootSourceObjectIds: [source.id],
+            fromVersion: base.version,
+            toVersion: revised.version,
             sourceContourIds: [sc.id],
             sourceHoleIds: [hole.id],
             targetObjectIds: promoted.map((o) => o.id),
@@ -345,10 +359,13 @@ function detectSideRelations(side: 'a' | 'b', base: ImageVersion, revised: Image
     const sources = base.objects.filter((source) => contourOverlapsObject(target.contours[0], source));
     if (sources.length > 1) {
       out.push({
-        id: 'relation:merge:' + side + ':' + relationKey(sources.map((s) => s.id)) + ':' + target.id,
+        id: relationId('merge', side, relationKey(sources.map((s) => s.id)) + ':' + target.id),
         kind: 'merge',
         side,
         sourceObjectIds: sources.map((s) => s.id),
+        rootSourceObjectIds: sources.map((s) => s.id),
+        fromVersion: base.version,
+        toVersion: revised.version,
         targetObjectIds: [target.id],
         message: '修订 ' + side.toUpperCase() + ' 将 ' + sources.length + ' 个物体合并为 ' + target.id,
       });
@@ -358,8 +375,131 @@ function detectSideRelations(side: 'a' | 'b', base: ImageVersion, revised: Image
   return out.filter((r, i, all) => all.findIndex((x) => x.id === r.id) === i);
 }
 
-export function detectMergeRelations(base: ImageVersion, a: ImageVersion, b: ImageVersion): MergeRelation[] {
-  return [...detectSideRelations('a', base, a), ...detectSideRelations('b', base, b)];
+function versionParents(v: ImageVersion): number[] {
+  const parents = v.mergeOf ? [v.mergeOf.a, v.mergeOf.b, v.basedOn].filter((n): n is number => n != null) : [];
+  if (v.basedOn != null && !parents.includes(v.basedOn)) parents.push(v.basedOn);
+  return [...new Set(parents)];
+}
+
+function ancestorSet(image: ImageRecord, version: number): Map<number, number> {
+  const depths = new Map<number, number>([[version, 0]]);
+  const queue = [version];
+  while (queue.length > 0) {
+    const currentNumber = queue.shift()!;
+    const current = image.versions.find((v) => v.version === currentNumber && v.status === 'submitted');
+    if (!current) continue;
+    for (const parent of versionParents(current)) {
+      if (depths.has(parent)) continue;
+      depths.set(parent, (depths.get(currentNumber) ?? 0) + 1);
+      queue.push(parent);
+    }
+  }
+  return depths;
+}
+
+/** 沿版本图找最近共同祖先；合并提交的两个来源也视为祖先边 */
+export function resolveMergeBase(image: ImageRecord, aVersion: number, bVersion: number): number {
+  if (aVersion === bVersion) throw new Error('两条修订不能是同一个版本');
+  getSubmitted(image, aVersion);
+  getSubmitted(image, bVersion);
+  const aAncestors = ancestorSet(image, aVersion);
+  const bAncestors = ancestorSet(image, bVersion);
+  if (aAncestors.has(bVersion)) throw new Error('v' + bVersion + ' 已包含 v' + aVersion + '，不能合并祖先与后代');
+  if (bAncestors.has(aVersion)) throw new Error('v' + aVersion + ' 已包含 v' + bVersion + '，不能合并祖先与后代');
+  let common: number | null = null;
+  for (const version of aAncestors.keys()) {
+    if (!bAncestors.has(version)) continue;
+    if (common == null || version > common) common = version;
+  }
+  if (common == null) throw new Error('v' + aVersion + ' 与 v' + bVersion + ' 没有共同祖先，无法合并');
+  return common;
+}
+
+function basedOnPath(image: ImageRecord, baseVersion: number, tipVersion: number): ImageVersion[] {
+  const path: ImageVersion[] = [];
+  let currentNumber = tipVersion;
+  const seen = new Set<number>();
+  while (currentNumber !== baseVersion) {
+    if (seen.has(currentNumber)) throw new Error('版本来源链存在循环：v' + currentNumber);
+    seen.add(currentNumber);
+    const current = getSubmitted(image, currentNumber);
+    path.unshift(current);
+    if (current.basedOn == null) throw new Error('无法从 v' + tipVersion + ' 追溯到共同祖先 v' + baseVersion);
+    currentNumber = current.basedOn;
+  }
+  return path;
+}
+
+function provenanceRoots(version: ImageVersion, objectId: string, fallback: Map<string, Set<string>>): Set<string> {
+  const obj = version.objects.find((o) => o.id === objectId);
+  const provenanceRoots = version.basedOn != null ? (obj?.provenance?.sources.map((s) => s.objectId) ?? []) : [];
+  const roots = provenanceRoots.length > 0 ? provenanceRoots : [...(fallback.get(objectId) ?? [objectId])];
+  return new Set(roots);
+}
+
+function targetRoots(
+  target: AnnotationObject,
+  rootIds: string[],
+  base: ImageVersion,
+  fallback: Set<string>,
+): Set<string> {
+  const roots = rootIds.filter((rootId) => {
+    const root = base.objects.find((obj) => obj.id === rootId);
+    return root?.contours.some((contour) => target.contours.some((targetContour) => polygonsShareArea(targetContour.points, contour.points)));
+  });
+  return new Set(roots.length > 0 ? roots : fallback);
+}
+
+function detectSideChainRelations(
+  image: ImageRecord,
+  side: 'a' | 'b',
+  base: ImageVersion,
+  tip: ImageVersion,
+): MergeRelation[] {
+  const chain: MergeRelation[] = [];
+  const rootsById = new Map<string, Set<string>>();
+  for (const obj of base.objects) rootsById.set(obj.id, new Set([obj.id]));
+  let previous = base;
+  for (const current of basedOnPath(image, base.version, tip.version)) {
+    const stepRelations = detectSideRelations(side, previous, current);
+    for (const relation of stepRelations) {
+      const rootSourceObjectIds = [...new Set(relation.sourceObjectIds.flatMap((sourceId) =>
+        [...provenanceRoots(previous, sourceId, rootsById)],
+      ))];
+      for (const targetId of relation.targetObjectIds) {
+        const target = current.objects.find((obj) => obj.id === targetId);
+        rootsById.set(
+          targetId,
+          target ? targetRoots(target, rootSourceObjectIds, base, new Set(rootSourceObjectIds)) : new Set(rootSourceObjectIds),
+        );
+      }
+      chain.push({
+        ...relation,
+        id: relation.id + ':v' + previous.version + '-v' + current.version,
+        rootSourceObjectIds,
+        fromVersion: previous.version,
+        toVersion: current.version,
+        message: relation.message + '（v' + previous.version + ' → v' + current.version + '，共同祖先来源：' + rootSourceObjectIds.join(', ') + '）',
+      });
+    }
+    previous = current;
+  }
+  return chain;
+}
+
+export function detectMergeRelations(
+  image: ImageRecord,
+  baseVersion: number,
+  aVersion: number,
+  bVersion: number,
+): MergeRelation[] {
+  const base = getSubmitted(image, baseVersion);
+  const a = getSubmitted(image, aVersion);
+  const b = getSubmitted(image, bVersion);
+  return [
+    ...detectSideChainRelations(image, 'a', base, a),
+    ...detectSideChainRelations(image, 'b', base, b),
+  ];
 }
 
 function normalizeSession(session: MergeSession): MergeSession {
@@ -367,7 +507,7 @@ function normalizeSession(session: MergeSession): MergeSession {
 }
 
 function provenanceSources(relation: MergeRelation): RegionSource[] {
-  return relation.sourceObjectIds.map((objectId) => {
+  return (relation.rootSourceObjectIds ?? relation.sourceObjectIds).map((objectId) => {
     const source: RegionSource = { objectId };
     source.contourId = relation.sourceContourIds?.[0];
     source.holeId = relation.sourceHoleIds?.[0];
@@ -425,7 +565,8 @@ function attachProvenance(obj: AnnotationObject, relation: MergeRelation, base: 
   const next = finalizeObject(obj);
   const sources: RegionSource[] = [];
   const baseObjectsById = new Map(base.objects.map((sourceObj) => [sourceObj.id, sourceObj]));
-  for (const sourceId of relation.sourceObjectIds) {
+  const rootSourceIds = relation.rootSourceObjectIds ?? relation.sourceObjectIds;
+  for (const sourceId of rootSourceIds) {
     const sourceContours = baseObjectsById.get(sourceId)?.contours ?? [];
     for (const sourceContour of sourceContours) {
       if (obj.contours.some((targetContour) => polygonsShareArea(targetContour.points, sourceContour.points))) {
@@ -449,7 +590,7 @@ function attachProvenance(obj: AnnotationObject, relation: MergeRelation, base: 
 
 function carrySourceHoles(obj: AnnotationObject, base: ImageVersion, relation: MergeRelation): AnnotationObject {
   for (const contour of obj.contours) {
-    for (const sourceId of relation.sourceObjectIds) {
+    for (const sourceId of relation.rootSourceObjectIds ?? relation.sourceObjectIds) {
       const sourceObj = base.objects.find((o) => o.id === sourceId);
       for (const sourceContour of sourceObj?.contours ?? []) {
         for (const hole of sourceContour.holes) {
@@ -470,10 +611,12 @@ function addSourceLevelConflicts(
   base: ImageVersion,
   a: ImageVersion,
   b: ImageVersion,
+  relations: MergeRelation[],
+  relationDecisions: Record<string, MergeRelationDecision>,
 ): void {
   const structuralVersion = relation.side === 'a' ? a : b;
   const otherVersion = relation.side === 'a' ? b : a;
-  for (const sourceId of relation.sourceObjectIds) {
+  for (const sourceId of relation.rootSourceObjectIds ?? relation.sourceObjectIds) {
     const baseObj = base.objects.find((o) => o.id === sourceId);
     const otherObj = otherVersion.objects.find((o) => o.id === sourceId);
     if (!baseObj || !otherObj) continue;
@@ -483,6 +626,13 @@ function addSourceLevelConflicts(
       ),
     );
     for (const target of applicableTargets) {
+      const consumedByConfirmedDownstream = relations.some((candidate) =>
+        candidate.side === relation.side &&
+        candidate.id !== relation.id &&
+        relationDecisions[candidate.id] === 'confirmed' &&
+        candidate.sourceObjectIds.includes(target.id),
+      );
+      if (consumedByConfirmedDownstream) continue;
       if (otherObj.categoryId !== baseObj.categoryId) {
         // 同一来源对同一最终区域的修改只裁决一次（连续拆合可能经多条关系到达同一目标）
         const id = 'category-source:' + sourceId + ':' + target.id;
@@ -575,7 +725,7 @@ function runRelationMerge(
       .filter((o): o is AnnotationObject => !!o)
       .map((o) => carrySourceHoles(attachProvenance(o, relation, base), base, relation));
     provisionalTargets.set(relation.id, targets);
-    addSourceLevelConflicts(ctx, relation, targets, base, a, b);
+    addSourceLevelConflicts(ctx, relation, targets, base, a, b, relations, relationDecisions);
   }
 
   for (const relation of relations) {
@@ -634,15 +784,17 @@ function runRelationMerge(
 }
 
 function runMerge(
+  image: ImageRecord,
   base: ImageVersion,
   a: ImageVersion,
   b: ImageVersion,
   resolutions: Record<string, MergeResolution>,
   relationDecisions: Record<string, MergeRelationDecision> = {},
   strict: boolean,
+  precomputedRelations?: MergeRelation[],
 ): { objects: AnnotationObject[]; conflicts: MergeConflict[] } {
   const ctx: Ctx = { conflicts: [], resolutions, strict };
-  const relations = detectMergeRelations(base, a, b);
+  const relations = precomputedRelations ?? detectMergeRelations(image, base.version, a.version, b.version);
   for (const relation of relations) addRelationConflict(ctx, relation, relationDecisions[relation.id]);
   if (relations.length > 0) {
     return runRelationMerge(ctx, base, a, b, relations, relationDecisions);
@@ -656,32 +808,22 @@ function getSubmitted(image: ImageRecord, version: number): ImageVersion {
   return v;
 }
 
-/** 校验两条修订是否来自同一基线版本，并返回基线版本号 */
-export function resolveMergeBase(image: ImageRecord, aVersion: number, bVersion: number): number {
-  if (aVersion === bVersion) throw new Error('两条修订不能是同一个版本');
-  const a = getSubmitted(image, aVersion);
-  const b = getSubmitted(image, bVersion);
-  if (a.basedOn == null || b.basedOn == null || a.basedOn !== b.basedOn) {
-    throw new Error('v' + aVersion + ' 与 v' + bVersion + ' 不是从同一版本分别修订的，无法合并');
-  }
-  getSubmitted(image, a.basedOn);
-  return a.basedOn;
-}
-
 /** 生成合并计划：自动合并不冲突的修改，列出需要用户裁决的冲突 */
 export function planMerge(image: ImageRecord, aVersion: number, bVersion: number): MergePlan {
   const baseVersion = resolveMergeBase(image, aVersion, bVersion);
   const baseSubmitted = getSubmitted(image, baseVersion);
   const aSubmitted = getSubmitted(image, aVersion);
   const bSubmitted = getSubmitted(image, bVersion);
-  const relations = detectMergeRelations(baseSubmitted, aSubmitted, bSubmitted);
+  const relations = detectMergeRelations(image, baseVersion, aVersion, bVersion);
   const { conflicts } = runMerge(
+    image,
     baseSubmitted,
     aSubmitted,
     bSubmitted,
     {},
     {},
     false,
+    relations,
   );
   return { baseVersion, aVersion, bVersion, conflicts, relations };
 }
@@ -721,9 +863,9 @@ export function applyMergeSession(image: ImageRecord, session: MergeSession, not
   const a = getSubmitted(image, session.aVersion);
   const b = getSubmitted(image, session.bVersion);
   const normalized = normalizeSession(session);
-  const planRelations = detectMergeRelations(base, a, b);
+  const planRelations = detectMergeRelations(image, session.baseVersion, session.aVersion, session.bVersion);
   const effective = effectiveResolutions(normalized, planRelations);
-  const { objects, conflicts } = runMerge(base, a, b, effective, normalized.relations, true);
+  const { objects, conflicts } = runMerge(image, base, a, b, effective, normalized.relations, true, planRelations);
   const unresolved = conflicts.filter((c) => !effective[c.id]);
   if (unresolved.length > 0) {
     throw new Error('还有 ' + unresolved.length + ' 处冲突未确认，不能完成合并');
