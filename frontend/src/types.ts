@@ -167,6 +167,8 @@ export interface ProjectData {
   exportedAt: string;
   images: ExportedImage[];
   categories: Category[];
+  /** 未完成的合并会话（含已保存的部分决定），导出后重新导入可继续比较 */
+  mergeSessions?: MergeSession[];
 }
 
 export interface ExportedImage {

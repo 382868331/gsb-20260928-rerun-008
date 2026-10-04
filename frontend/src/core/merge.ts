@@ -656,16 +656,46 @@ function getSubmitted(image: ImageRecord, version: number): ImageVersion {
   return v;
 }
 
-/** 校验两条修订是否来自同一基线版本，并返回基线版本号 */
+/**
+ * 沿 basedOn 返工链与 mergeOf 合并来源逐层展开某个版本的全部祖先
+ *（按离起点的距离排序，自身在首位）。连续返工保存成多个修订后，
+ * 两条链长度可以不同，只要存在共同祖先即可核对。
+ */
+function ancestorChain(image: ImageRecord, start: ImageVersion): number[] {
+  const chain: number[] = [];
+  const seen = new Set<number>();
+  const queue: ImageVersion[] = [start];
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    if (seen.has(cur.version)) continue;
+    seen.add(cur.version);
+    chain.push(cur.version);
+    const parents: (number | null | undefined)[] = [cur.basedOn];
+    if (cur.mergeOf) parents.push(cur.mergeOf.base, cur.mergeOf.a, cur.mergeOf.b);
+    for (const parent of parents) {
+      if (parent == null || seen.has(parent)) continue;
+      const pv = image.versions.find((x) => x.version === parent && x.status === 'submitted');
+      if (pv) queue.push(pv);
+    }
+  }
+  return chain;
+}
+
+/**
+ * 沿两条修订各自的来源链寻找最近的共同祖先版本作为合并基线。
+ * 不再要求两条修订的直接父版本相同：先拆分再局部合并的多代链
+ * 可以与仍修改最早物体的另一链合并，中间提交无需压缩。
+ */
 export function resolveMergeBase(image: ImageRecord, aVersion: number, bVersion: number): number {
   if (aVersion === bVersion) throw new Error('两条修订不能是同一个版本');
   const a = getSubmitted(image, aVersion);
   const b = getSubmitted(image, bVersion);
-  if (a.basedOn == null || b.basedOn == null || a.basedOn !== b.basedOn) {
-    throw new Error('v' + aVersion + ' 与 v' + bVersion + ' 不是从同一版本分别修订的，无法合并');
+  const bAncestors = new Set(ancestorChain(image, b));
+  const common = ancestorChain(image, a).find((v) => bAncestors.has(v));
+  if (common == null) {
+    throw new Error('v' + aVersion + ' 与 v' + bVersion + ' 的来源链没有共同祖先版本，无法合并');
   }
-  getSubmitted(image, a.basedOn);
-  return a.basedOn;
+  return common;
 }
 
 /** 生成合并计划：自动合并不冲突的修改，列出需要用户裁决的冲突 */

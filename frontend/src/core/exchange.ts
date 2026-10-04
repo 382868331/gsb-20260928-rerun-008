@@ -5,27 +5,42 @@ import type {
   ImageVersion,
   ImportIssue,
   ImportResult,
+  MergeSession,
   ProjectData,
 } from '../types';
 import { validateVersion } from './validation';
 import { createImage, nowIso } from './versioning';
 
-/** 导出：仅包含已提交版本，草稿不导出 */
-export function exportProject(images: ImageRecord[], categories: Category[]): ProjectData {
+/** 导出：仅包含已提交版本，草稿不导出；未完成的合并会话随版本一起导出 */
+export function exportProject(
+  images: ImageRecord[],
+  categories: Category[],
+  mergeSessions: MergeSession[] = [],
+): ProjectData {
+  const exportedImages = images
+    .map((image) => ({
+      id: image.id,
+      name: image.name,
+      width: image.width,
+      height: image.height,
+      dataUrl: image.dataUrl,
+      submittedVersions: image.versions.filter((v) => v.status === 'submitted'),
+    }))
+    .filter((e) => e.submittedVersions.length > 0);
+  const exportedById = new Map(exportedImages.map((e) => [e.id, e]));
+  // 只导出能在文件中继续的会话：图片已导出且基线/两条修订版本都在
+  const sessions = mergeSessions.filter((s) => {
+    const entry = exportedById.get(s.imageId);
+    if (!entry) return false;
+    const has = (n: number) => entry.submittedVersions.some((v) => v.version === n);
+    return has(s.baseVersion) && has(s.aVersion) && has(s.bVersion);
+  });
   return {
     version: 1,
     exportedAt: nowIso(),
     categories: structuredClone(categories),
-    images: images
-      .map((image) => ({
-        id: image.id,
-        name: image.name,
-        width: image.width,
-        height: image.height,
-        dataUrl: image.dataUrl,
-        submittedVersions: image.versions.filter((v) => v.status === 'submitted'),
-      }))
-      .filter((e) => e.submittedVersions.length > 0),
+    images: exportedImages,
+    ...(sessions.length > 0 ? { mergeSessions: structuredClone(sessions) } : {}),
   };
 }
 
@@ -51,6 +66,22 @@ export interface ImportOptions {
   /** 与导入文件 id 匹配的现有图片，可用于补回缺失的图片数据 */
   existingImages: ImageRecord[];
   existingCategories: Category[];
+  /** 本地未完成的合并会话；文件中的会话不会覆盖它们 */
+  existingMergeSessions?: MergeSession[];
+}
+
+function isValidSessionShape(v: unknown): v is MergeSession {
+  if (!v || typeof v !== 'object') return false;
+  const s = v as Partial<MergeSession>;
+  return (
+    typeof s.id === 'string' &&
+    typeof s.imageId === 'string' &&
+    Number.isInteger(s.baseVersion) &&
+    Number.isInteger(s.aVersion) &&
+    Number.isInteger(s.bVersion) &&
+    (s.resolutions === undefined || (typeof s.resolutions === 'object' && s.resolutions !== null)) &&
+    (s.relations === undefined || (typeof s.relations === 'object' && s.relations !== null))
+  );
 }
 
 /**
@@ -62,7 +93,7 @@ export interface ImportOptions {
 export function importProject(
   raw: string, 
   options: ImportOptions,
-): { result: ImportResult; images: ImageRecord[]; categories: Category[] } {
+): { result: ImportResult; images: ImageRecord[]; categories: Category[]; mergeSessions: MergeSession[] } {
   const issues: ImportIssue[] = [];
   const accepted: string[] = [];
   const rejected: string[] = [];
@@ -85,6 +116,7 @@ export function importProject(
       },
       images: options.existingImages,
       categories: options.existingCategories,
+      mergeSessions: options.existingMergeSessions ?? [],
     };
   }
 
@@ -98,6 +130,7 @@ export function importProject(
       },
       images: options.existingImages,
       categories: options.existingCategories,
+      mergeSessions: options.existingMergeSessions ?? [],
     };
   }
 
@@ -214,6 +247,34 @@ export function importProject(
     accepted.push(id);
   }
 
+  // 恢复文件中未完成的合并会话：版本号随图片一起导入，会话可直接继续比较。
+  // 本地同图已有会话时保留本地进度，不被文件覆盖。
+  const sessionByImage = new Map<string, MergeSession>(
+    (options.existingMergeSessions ?? []).map((s) => [s.imageId, s]),
+  );
+  for (const raw of Array.isArray(root.mergeSessions) ? root.mergeSessions : []) {
+    if (!isValidSessionShape(raw)) continue;
+    if (sessionByImage.has(raw.imageId)) continue;
+    const image = imagesById.get(raw.imageId);
+    if (!image) continue;
+    const hasSubmitted = (n: number) =>
+      image.versions.some((v) => v.version === n && v.status === 'submitted');
+    if (!hasSubmitted(raw.baseVersion) || !hasSubmitted(raw.aVersion) || !hasSubmitted(raw.bVersion)) {
+      continue;
+    }
+    sessionByImage.set(raw.imageId, {
+      id: raw.id,
+      imageId: raw.imageId,
+      baseVersion: raw.baseVersion,
+      aVersion: raw.aVersion,
+      bVersion: raw.bVersion,
+      resolutions: { ...(raw.resolutions ?? {}) },
+      relations: { ...(raw.relations ?? {}) },
+      createdAt: raw.createdAt ?? nowIso(),
+      updatedAt: raw.updatedAt ?? nowIso(),
+    });
+  }
+
   // 防御：若本地某张图只有草稿且被导入数据关联，保持草稿不动
   return {
     result: { accepted, rejected, issues },
@@ -221,6 +282,7 @@ export function importProject(
       options.existingImages.some((e) => e.id === img.id) || accepted.includes(img.id),
     ),
     categories,
+    mergeSessions: [...sessionByImage.values()],
   };
 }
 

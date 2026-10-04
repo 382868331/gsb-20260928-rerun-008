@@ -14,7 +14,7 @@ import {
   submitDraft,
   updateDraftObject,
 } from './versioning';
-import { exportProject } from './exchange';
+import { exportProject, importProject } from './exchange';
 import type { AnnotationObject, ImageRecord, MergeSession } from '../types';
 
 const cats = defaultCategories();
@@ -160,11 +160,32 @@ describe('merge', () => {
     expect(last.mergeOf).toEqual({ base: 1, a: 2, b: 3 });
   });
 
-  it('rejects revisions from different bases', () => {
+  it('merges revisions along a linear rework chain via their common ancestor', () => {
+    const { img: base, obj1 } = baseImage();
+    let img = revise(base, 1, (objs) => {
+      objs.find((o) => o.id === obj1)!.categoryId = cats[1].id;
+    }); // v2 基于 v1
+    img = revise(img, 2, (objs) => {
+      objs.find((o) => o.id === obj1)!.contours[0].points[0] = { x: 5, y: 5 };
+    }); // v3 基于 v2：与 v2 的直接父版本不同，但存在共同祖先
+    const plan = planMerge(img, 2, 3);
+    expect(plan.baseVersion).toBe(2);
+    expect(plan.conflicts).toHaveLength(0);
+    const v = merged(img, createMergeSession(img, 2, 3));
+    const o1 = v.objects.find((o) => o.id === obj1)!;
+    expect(o1.categoryId).toBe(cats[1].id);
+    expect(o1.contours[0].points[0]).toEqual({ x: 5, y: 5 });
+  });
+
+  it('rejects revisions whose source chains share no ancestor', () => {
     const { img: base } = baseImage();
-    let img = revise(base, 1, () => {});
-    img = revise(img, 2, () => {}); // v3 基于 v2，而 v2 基于 v1
-    expect(() => resolveMergeBase(img, 2, 3)).toThrow(/同一版本/);
+    const img2 = structuredClone(base);
+    // v2 是人为构造的独立根（如来自其它导出的记录），与 v1 无共同祖先
+    const alien = structuredClone(base.versions[0]);
+    alien.version = 2;
+    alien.basedOn = null;
+    img2.versions.push(alien);
+    expect(() => resolveMergeBase(img2, 1, 2)).toThrow(/共同祖先/);
   });
 
   it('merges holes added on one side and removed on the other independently', () => {

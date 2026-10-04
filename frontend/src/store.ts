@@ -188,14 +188,23 @@ export const useStore = create<AppState>()(
         set((s) => ({ categories: [...s.categories, { id: uid('cat'), name, color }] })),
 
       exportJson: () => {
-        const { images, categories } = get();
-        return JSON.stringify(exportProject(images, categories));
+        const { images, categories, mergeSessions } = get();
+        return JSON.stringify(exportProject(images, categories, mergeSessions));
       },
 
       importJson: (raw) => {
-        const { images, categories } = get();
-        const out = importProject(raw, { existingImages: images, existingCategories: categories });
-        set({ images: out.images, categories: out.categories, lastImport: out.result });
+        const { images, categories, mergeSessions } = get();
+        const out = importProject(raw, {
+          existingImages: images,
+          existingCategories: categories,
+          existingMergeSessions: mergeSessions,
+        });
+        set({
+          images: out.images,
+          categories: out.categories,
+          lastImport: out.result,
+          mergeSessions: out.mergeSessions,
+        });
         return out.result;
       },
 
