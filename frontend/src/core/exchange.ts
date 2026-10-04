@@ -5,6 +5,8 @@ import type {
   ImageVersion,
   ImportIssue,
   ImportResult,
+  MergeRelationDecision,
+  MergeResolution,
   MergeSession,
   ProjectData,
 } from '../types';
@@ -73,14 +75,26 @@ export interface ImportOptions {
 function isValidSessionShape(v: unknown): v is MergeSession {
   if (!v || typeof v !== 'object') return false;
   const s = v as Partial<MergeSession>;
+  const validResolutions = new Set<MergeResolution>([
+    'a', 'b', 'adopt-a', 'adopt-b', 'confirmed', 'rejected', 'discard', 'disputed',
+  ]);
+  const validRelationDecisions = new Set<MergeRelationDecision>([
+    'confirmed', 'rejected', 'disputed',
+  ]);
+  const validMap = (map: unknown, allowed: Set<string>) => {
+    if (typeof map !== 'object' || map === null) return false;
+    return Object.entries(map as Record<string, unknown>).every(
+      ([key, value]) => typeof key === 'string' && allowed.has(value as string),
+    );
+  };
   return (
     typeof s.id === 'string' &&
     typeof s.imageId === 'string' &&
     Number.isInteger(s.baseVersion) &&
     Number.isInteger(s.aVersion) &&
     Number.isInteger(s.bVersion) &&
-    (s.resolutions === undefined || (typeof s.resolutions === 'object' && s.resolutions !== null)) &&
-    (s.relations === undefined || (typeof s.relations === 'object' && s.relations !== null))
+    (s.resolutions === undefined || validMap(s.resolutions, validResolutions)) &&
+    (s.relations === undefined || validMap(s.relations, validRelationDecisions))
   );
 }
 

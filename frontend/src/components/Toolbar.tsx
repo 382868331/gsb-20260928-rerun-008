@@ -11,6 +11,7 @@ export function Toolbar() {
   const importJson = useStore((s) => s.importJson);
   const images = useStore((s) => s.images);
   const categories = useStore((s) => s.categories);
+  const mergeSessions = useStore((s) => s.mergeSessions);
 
   async function onPickImages(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? []);
@@ -22,7 +23,7 @@ export function Toolbar() {
   }
 
   function onExport() {
-    const data = exportProject(images, categories);
+    const data = exportProject(images, categories, mergeSessions);
     if (data.images.length === 0) {
       alert('还没有任何已提交结果可导出。请先标注并提交。');
       return;
