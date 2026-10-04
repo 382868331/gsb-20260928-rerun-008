@@ -57,6 +57,98 @@ function revise(img: ImageRecord, fromVersion: number, mutate: (objects: Annotat
 }
 
 describe('multi-generation merge chains', () => {
+  function chainImage(): { img: ImageRecord; obj1: string; obj2: string } {
+    const { img: base, obj1, obj2 } = baseImage();
+    let img = revise(base, 1, (objs) => {
+      const i = objs.findIndex((o) => o.id === obj1);
+      const createdAt = new Date().toISOString();
+      objs.splice(i, 1,
+        {
+          id: 'split-left', categoryId: cats[0].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([{ x: 10, y: 10 }, { x: 69, y: 10 }, { x: 69, y: 90 }, { x: 10, y: 90 }])],
+        },
+        {
+          id: 'split-right', categoryId: cats[0].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([{ x: 70, y: 10 }, { x: 90, y: 10 }, { x: 90, y: 90 }, { x: 70, y: 90 }])],
+        },
+      );
+    });
+    img = revise(img, 2, (objs) => {
+      const createdAt = new Date().toISOString();
+      objs.splice(0, objs.length,
+        objs.find((o) => o.id === 'split-left')!,
+        {
+          id: 'merged-obj', categoryId: cats[1].id, createdAt, updatedAt: createdAt,
+          contours: [createContour([{ x: 70, y: 10 }, { x: 190, y: 10 }, { x: 190, y: 190 }, { x: 70, y: 190 }])],
+        },
+      );
+    });
+    img = revise(img, 1, (objs) => {
+      objs.find((o) => o.id === obj1)!.categoryId = cats[2].id;
+    });
+    return { img, obj1, obj2 };
+  }
+
+  it('export/reopen preserves progress at fresh, partial and disputed stages', () => {
+    const freshImport = (img: ImageRecord, session: ReturnType<typeof createMergeSession>) => {
+      const data = exportProject([img], cats, [session]);
+      expect(data.mergeSessions).toHaveLength(1);
+      const out = importProject(JSON.stringify(data), {
+        existingImages: [],
+        existingCategories: cats,
+      });
+      expect(out.result.accepted).toEqual([img.id]);
+      expect(out.mergeSessions).toHaveLength(1);
+      const restoredImg = out.images.find((i) => i.id === img.id)!;
+      expect(restoredImg.versions.map((v) => v.version)).toEqual([1, 2, 3, 4]);
+      return { restored: out.mergeSessions[0], restoredImg };
+    };
+
+    {
+      const { img } = chainImage();
+      const session = createMergeSession(img, 3, 4);
+      const { restored, restoredImg } = freshImport(img, session);
+      expect(restored.resolutions).toEqual({});
+      expect(restored.relations).toEqual({});
+      const plan = planMerge(restoredImg, restored.aVersion, restored.bVersion);
+      expect(plan.relations).toHaveLength(2);
+      expect(() => applyMergeSession(restoredImg, restored)).toThrow(/未确认/);
+    }
+
+    {
+      const { img } = chainImage();
+      const session = createMergeSession(img, 3, 4);
+      const splitRel = planMerge(img, 3, 4).relations.find((r) => r.kind === 'split')!;
+      session.relations[splitRel.id] = 'confirmed';
+      const { restored, restoredImg } = freshImport(img, session);
+      expect(restored.relations[splitRel.id]).toBe('confirmed');
+      expect(() => applyMergeSession(restoredImg, restored)).toThrow(/未确认/);
+    }
+
+    {
+      const { img, obj1, obj2 } = chainImage();
+      const session = createMergeSession(img, 3, 4);
+      const plan = planMerge(img, 3, 4);
+      for (const rel of plan.relations) session.relations[rel.id] = 'confirmed';
+      const conflicts = plan.conflicts.filter((c) => c.dependsOn);
+      expect(conflicts.length).toBeGreaterThan(0);
+      session.resolutions[conflicts[0].id] = 'disputed';
+      const { restored, restoredImg } = freshImport(img, session);
+      expect(restored.resolutions[conflicts[0].id]).toBe('disputed');
+      expect(() => applyMergeSession(restoredImg, restored)).toThrow(/争议/);
+      for (const c of conflicts) restored.resolutions[c.id] = 'adopt-b';
+      const out = applyMergeSession(restoredImg, restored);
+      const v = out.versions[out.versions.length - 1];
+      expect(v.status).toBe('submitted');
+      expect(v.mergeOf).toEqual({ base: 1, a: 3, b: 4 });
+      expect(v.mergeAudit?.relations).toHaveLength(2);
+      const big = v.objects.find((o) => o.id === 'merged-obj')!;
+      expect(big.provenance?.transformation).toBe('merge');
+      expect(big.provenance?.sources.map((s) => s.objectId).sort()).toEqual([obj1, obj2].sort());
+      expect(out.versions.slice(0, 4).map((ver) => ver.version)).toEqual([1, 2, 3, 4]);
+    }
+  });
+
   it('merges tips of multi-generation chains without squashing intermediate commits', () => {
     const { img: base, obj1, obj2 } = baseImage();
     // 链 A 第一代 v2：obj1 拆成左右两半
