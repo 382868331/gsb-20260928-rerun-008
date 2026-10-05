@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { Category, ImageRecord, ImportResult, MergeRelationDecision, MergeResolution, MergeSession, Point } from './types';
+import type { Category, ImageRecord, ImportResult, MergeConstraint, MergeRelationDecision, MergeResolution, MergeSession, Point } from './types';
 import {
   addDraftObject,
   createContour,
@@ -16,6 +16,7 @@ import { createImage } from './core/versioning';
 import type { LoadedImage } from './core/images';
 import { exportProject, importProject } from './core/exchange';
 import { applyMergeSession, createMergeSession, planMerge } from './core/merge';
+import { applyPlanningOption, buildMergePlanning, withdrawDecision } from './core/planning';
 import { uid } from './core/geometry';
 import { nowIso } from './core/versioning';
 
@@ -49,6 +50,10 @@ interface AppState {
   unresolveConflict: (conflictId: string) => void;
   cancelMerge: () => void;
   completeMerge: (note?: string) => void;
+  addMergeConstraint: (constraint: Omit<MergeConstraint, 'id'>) => void;
+  removeMergeConstraint: (constraintId: string) => void;
+  approveMergePlan: (candidateIds: string[]) => void;
+  withdrawMergeDecision: (decisionId: string) => string[];
 }
 
 function mutateImage(images: ImageRecord[], id: string | null, fn: (img: ImageRecord) => ImageRecord): ImageRecord[] {
@@ -276,6 +281,49 @@ export const useStore = create<AppState>()(
           images: mutateImage(images, selectedImageId, (img) => applyMergeSession(img, session, note)),
           mergeSessions: mergeSessions.filter((m) => m.imageId !== selectedImageId),
         });
+      },
+
+      addMergeConstraint: (constraint) =>
+        set((s) => ({
+          mergeSessions: s.mergeSessions.map((m) =>
+            m.imageId === s.selectedImageId
+              ? { ...m, constraints: [...(m.constraints ?? []), { ...constraint, id: uid('mc') }], updatedAt: nowIso() }
+              : m,
+          ),
+        })),
+
+      removeMergeConstraint: (constraintId) =>
+        set((s) => ({
+          mergeSessions: s.mergeSessions.map((m) =>
+            m.imageId === s.selectedImageId
+              ? { ...m, constraints: (m.constraints ?? []).filter((c) => c.id !== constraintId), updatedAt: nowIso() }
+              : m,
+          ),
+        })),
+
+      approveMergePlan: (candidateIds) => {
+        const { images, selectedImageId, mergeSessions } = get();
+        const session = mergeSessions.find((m) => m.imageId === selectedImageId);
+        const image = images.find((i) => i.id === selectedImageId);
+        if (!session || !image) throw new Error('当前没有进行中的合并');
+        const planning = buildMergePlanning(image, session.aVersion, session.bVersion, session.constraints ?? [], session);
+        const next = applyPlanningOption(session, planning, candidateIds);
+        set({
+          mergeSessions: mergeSessions.map((m) => (m.imageId === selectedImageId ? next : m)),
+        });
+      },
+
+      withdrawMergeDecision: (decisionId) => {
+        const { images, selectedImageId, mergeSessions } = get();
+        const session = mergeSessions.find((m) => m.imageId === selectedImageId);
+        const image = images.find((i) => i.id === selectedImageId);
+        if (!session || !image) throw new Error('当前没有进行中的合并');
+        const planning = buildMergePlanning(image, session.aVersion, session.bVersion, session.constraints ?? [], session);
+        const { session: next, impact } = withdrawDecision(session, planning, decisionId);
+        set({
+          mergeSessions: mergeSessions.map((m) => (m.imageId === selectedImageId ? next : m)),
+        });
+        return impact.affectedObjectIds;
       },
     }),
     { name: 'annotation-platform-v1' },

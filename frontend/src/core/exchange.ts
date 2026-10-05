@@ -270,6 +270,17 @@ export function importProject(
       bVersion: raw.bVersion,
       resolutions: { ...(raw.resolutions ?? {}) },
       relations: { ...(raw.relations ?? {}) },
+      constraints: Array.isArray(raw.constraints)
+        ? raw.constraints
+            .map((c) => ({
+              id: String(c.id ?? ''),
+              kind: c.kind === 'group' ? ('group' as const) : ('category' as const),
+              sourceObjectIds: Array.isArray(c.sourceObjectIds) ? c.sourceObjectIds.map(String) : [],
+              categoryId: c.categoryId == null ? undefined : String(c.categoryId),
+              groupId: c.groupId == null ? undefined : String(c.groupId),
+            }))
+            .filter((c) => c.id && c.sourceObjectIds.length > 0)
+        : undefined,
       createdAt: raw.createdAt ?? nowIso(),
       updatedAt: raw.updatedAt ?? nowIso(),
     });

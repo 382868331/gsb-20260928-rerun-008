@@ -143,6 +143,87 @@ export interface MergeSession {
   relations: Record<string, MergeRelationDecision>;
   createdAt: string;
   updatedAt: string;
+  /** 用户对基线物体指定的保留类别/分组约束，规划时据此筛选候选 */
+  constraints?: MergeConstraint[];
+}
+
+/**
+ * 来源保留约束：
+ * - category：要求来源物体最终落在某个类别的候选中；
+ * - group：同一组的来源必须共同落入同一个候选，不能被拆到不同物体。
+ */
+export interface MergeConstraint {
+  id: string;
+  kind: 'category' | 'group';
+  /** 该约束保护的基线物体 id */
+  sourceObjectIds: string[];
+  /** kind=category 时要求的类别 */
+  categoryId?: string;
+  /** kind=group 时的分组标识，同组来源必须共同采用 */
+  groupId?: string;
+}
+
+/** 合并规划中的一个可采用候选：一组最终物体及其覆盖的基线来源 */
+export interface MergeCandidate {
+  id: string;
+  /** 候选包含的最终物体 id（结构候选为关系目标，保留候选为来源自身） */
+  objectIds: string[];
+  /** 实际覆盖到的基线物体（几何共享区域 + provenance 推导） */
+  coveredSourceIds: string[];
+  /** 采用该候选必须一并确认的拆合关系；保留候选对应拒绝 */
+  relationId: string;
+  relationDecision: MergeRelationDecision;
+  side: 'a' | 'b' | 'base';
+  categoryId: string;
+  /** 是否为不允许删除的独立来源保留候选（来源未被任何关系触及） */
+  independent: boolean;
+  label: string;
+}
+
+/** 两个候选不能共同采用的原因 */
+export interface MergeIncompatibility {
+  candidateAId: string;
+  candidateBId: string;
+  reason: 'shared-source' | 'relation-conflict' | 'same-object';
+  message: string;
+}
+
+/** 一份可比较的最小冲突合并方案 */
+export interface MergePlanOption {
+  id: string;
+  candidateIds: string[];
+  /** 覆盖全部基线来源（按区域计），无重复归属 */
+  complete: boolean;
+  uncoveredSourceIds: string[];
+  /** 满足/违反的用户约束 id */
+  satisfiedConstraintIds: string[];
+  violatedConstraintIds: string[];
+  /** 采用后仍需逐项裁决的冲突数（越少越优先） */
+  remainingConflictCount: number;
+  /** 相对当前已裁决内容还需新增的决定数 */
+  additionalDecisionCount: number;
+  /** 需要撤回的现有决定 id */
+  conflictingDecisionIds: string[];
+  summary: string;
+}
+
+/** 无法同时满足的最小决定/约束集合 */
+export interface MergeDecisionSet {
+  /** 互斥的候选 id 或约束 id */
+  memberIds: string[];
+  kind: 'candidate-conflict' | 'constraint-unsatisfiable' | 'decision-conflict';
+  message: string;
+}
+
+/** 撤回一项决定后的影响范围 */
+export interface MergeWithdrawalImpact {
+  withdrawnId: string;
+  /** 必须一并重开的依赖闭合决定 */
+  reopenedDecisionIds: string[];
+  /** 受影响后退回未决的最终物体 id */
+  affectedObjectIds: string[];
+  /** 受影响的候选/方案 id */
+  affectedCandidateIds: string[];
 }
 
 export interface ImageRecord {
