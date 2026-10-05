@@ -76,6 +76,53 @@ export interface MergeRelation {
 
 export type MergeRelationDecision = 'confirmed' | 'rejected' | 'disputed';
 
+export type MergeConstraintKind = 'keep-category' | 'keep-group';
+
+export interface MergeConstraint {
+  id: string;
+  kind: MergeConstraintKind;
+  /** 涉及的物体 id（基线或任一修订中的物体） */
+  objectIds: string[];
+  /** keep-category 时必须保留的类别 */
+  categoryId?: string;
+  note?: string;
+}
+
+/** 一份可比较的合并方案：一组完整的拆合关系决定及其后果预览 */
+export interface MergePlanOption {
+  id: string;
+  label: string;
+  /** relationId 到 confirmed/rejected，方案对每条拆合关系都给出决定 */
+  relationDecisions: Record<string, MergeRelationDecision>;
+  /** 方案落地后仍需逐项裁决的冲突（关系决定本身不含在内） */
+  pendingConflicts: MergeConflict[];
+  /** 最终物体预览：id、类别与来源 */
+  finalObjects: { id: string; categoryId: string; sources: RegionSource[] }[];
+  /** 违反的用户约束（可读描述） */
+  violations: string[];
+  /** 同一来源被矛盾分配（共享祖先被重复算成两个物体）的说明 */
+  duplicateSources: string[];
+  /** 为消除冲突而被删除、但仍有独立来源的物体 */
+  droppedIndependent: string[];
+  /** 满足全部约束且来源无矛盾 */
+  feasible: boolean;
+}
+
+/** 一组无法同时满足的决定 */
+export interface IncompatibleDecisionSet {
+  /** 形如 relationId=confirmed 的决定 */
+  decisions: string[];
+  reason: string;
+}
+
+export interface MergePlanComparison {
+  baseVersion: number;
+  options: MergePlanOption[];
+  incompatibilities: IncompatibleDecisionSet[];
+}
+
+/** 用户为部分物体指定的必须保留约束：类别或分组 */
+
 export type MergePartKind =
   | 'object-existence'
   | 'category'
@@ -141,6 +188,8 @@ export interface MergeSession {
   resolutions: Record<string, MergeResolution>;
   /** relationId -> 已确认/舍弃/争议的拆合关系 */
   relations: Record<string, MergeRelationDecision>;
+  /** 用户为本次合并指定的必须保留约束 */
+  constraints?: MergeConstraint[];
   createdAt: string;
   updatedAt: string;
 }

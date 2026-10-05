@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { Category, ImageRecord, ImportResult, MergeRelationDecision, MergeResolution, MergeSession, Point } from './types';
+import type { Category, ImageRecord, ImportResult, MergeConstraint, MergePlanOption, MergeRelationDecision, MergeResolution, MergeSession, Point } from './types';
 import {
   addDraftObject,
   createContour,
@@ -16,6 +16,7 @@ import { createImage } from './core/versioning';
 import type { LoadedImage } from './core/images';
 import { exportProject, importProject } from './core/exchange';
 import { applyMergeSession, createMergeSession, planMerge } from './core/merge';
+import { applyPlanToSession } from './core/merge-plans';
 import { uid } from './core/geometry';
 import { nowIso } from './core/versioning';
 
@@ -49,6 +50,9 @@ interface AppState {
   unresolveConflict: (conflictId: string) => void;
   cancelMerge: () => void;
   completeMerge: (note?: string) => void;
+  addMergeConstraint: (constraint: Omit<MergeConstraint, 'id'>) => void;
+  removeMergeConstraint: (constraintId: string) => void;
+  applyMergePlan: (option: MergePlanOption, onlyRelationIds?: string[]) => void;
 }
 
 function mutateImage(images: ImageRecord[], id: string | null, fn: (img: ImageRecord) => ImageRecord): ImageRecord[] {
@@ -267,6 +271,46 @@ export const useStore = create<AppState>()(
 
       cancelMerge: () =>
         set((s) => ({ mergeSessions: s.mergeSessions.filter((m) => m.imageId !== s.selectedImageId) })),
+
+      addMergeConstraint: (constraint) =>
+        set((s) => ({
+          mergeSessions: s.mergeSessions.map((m) =>
+            m.imageId === s.selectedImageId
+              ? {
+                  ...m,
+                  constraints: [...(m.constraints ?? []), { ...constraint, id: uid('mc') }],
+                  updatedAt: nowIso(),
+                }
+              : m,
+          ),
+        })),
+
+      removeMergeConstraint: (constraintId) =>
+        set((s) => ({
+          mergeSessions: s.mergeSessions.map((m) =>
+            m.imageId === s.selectedImageId
+              ? {
+                  ...m,
+                  constraints: (m.constraints ?? []).filter((c) => c.id !== constraintId),
+                  updatedAt: nowIso(),
+                }
+              : m,
+          ),
+        })),
+
+      applyMergePlan: (option, onlyRelationIds) =>
+        set((s) => {
+          const session = s.mergeSessions.find((m) => m.imageId === s.selectedImageId);
+          const image = s.images.find((i) => i.id === s.selectedImageId);
+          if (!session || !image) return s;
+          const conflicts = planMerge(image, session.aVersion, session.bVersion).conflicts;
+          const next = applyPlanToSession(session, option, conflicts, onlyRelationIds);
+          return {
+            mergeSessions: s.mergeSessions.map((m) =>
+              m.imageId === s.selectedImageId ? { ...next, updatedAt: nowIso() } : m,
+            ),
+          };
+        }),
 
       completeMerge: (note) => {
         const { images, selectedImageId, mergeSessions } = get();

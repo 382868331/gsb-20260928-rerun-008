@@ -277,7 +277,7 @@ function contourOverlapsObject(contour: Contour, obj: AnnotationObject): boolean
   return obj.contours.some((other) => polygonsShareArea(contour.points, other.points));
 }
 
-function polygonsShareArea(a: Point[], b: Point[]): boolean {
+export function polygonsShareArea(a: Point[], b: Point[]): boolean {
   if (polygonArea(a) === 0 || polygonArea(b) === 0) return false;
   const strictlyInside = (p: Point, poly: Point[]) => pointInPolygon(p, poly) && !pointOnPolygonBoundary(p, poly);
   const samples = (points: Point[]) =>
@@ -740,6 +740,26 @@ function effectiveResolutions(session: MergeSession, relations: MergeRelation[])
     resolutions['conflict:' + relation.id] = decision === 'confirmed' ? relation.side : decision;
   }
   return resolutions;
+}
+
+/**
+ * 用给定的一组拆合关系决定试算合并结果（不落地），
+ * 供合并方案比较：预览最终物体与待裁决冲突。
+ */
+export function simulateMerge(
+  image: ImageRecord,
+  aVersion: number,
+  bVersion: number,
+  relationDecisions: Record<string, MergeRelationDecision> = {},
+  resolutions: Record<string, MergeResolution> = {},
+): { baseVersion: number; objects: AnnotationObject[]; conflicts: MergeConflict[]; relations: MergeRelation[] } {
+  const baseVersion = resolveMergeBase(image, aVersion, bVersion);
+  const base = getSubmitted(image, baseVersion);
+  const a = getSubmitted(image, aVersion);
+  const b = getSubmitted(image, bVersion);
+  const relations = detectMergeRelations(base, a, b);
+  const { objects, conflicts } = runMerge(base, a, b, resolutions, relationDecisions, false);
+  return { baseVersion, objects, conflicts, relations };
 }
 
 /**

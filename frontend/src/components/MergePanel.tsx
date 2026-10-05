@@ -2,7 +2,8 @@ import { useMemo, useState } from 'react';
 import { GitMerge, Undo2, X } from 'lucide-react';
 import { useStore } from '../store';
 import { planMerge } from '../core/merge';
-import type { Category, ImageRecord, MergeConflict, MergeRelationDecision, MergeResolution } from '../types';
+import { compareMergePlans } from '../core/merge-plans';
+import type { Category, ImageRecord, MergeConflict, MergeConstraintKind, MergeRelationDecision, MergeResolution } from '../types';
 
 function isPoints(v: unknown): v is { x: number; y: number }[] {
   return Array.isArray(v) && v.every((p) => p && typeof p === 'object' && 'x' in p);
@@ -128,10 +129,16 @@ export function MergePanel({ image }: { image: ImageRecord }) {
   const unresolveConflict = useStore((s) => s.unresolveConflict);
   const cancelMerge = useStore((s) => s.cancelMerge);
   const completeMerge = useStore((s) => s.completeMerge);
+  const addMergeConstraint = useStore((s) => s.addMergeConstraint);
+  const removeMergeConstraint = useStore((s) => s.removeMergeConstraint);
+  const applyMergePlan = useStore((s) => s.applyMergePlan);
   const submitted = image.versions.filter((v) => v.status === 'submitted');
   const [aVer, setAVer] = useState<number | ''>('');
   const [bVer, setBVer] = useState<number | ''>('');
   const [error, setError] = useState<string | null>(null);
+  const [constraintKind, setConstraintKind] = useState<MergeConstraintKind>('keep-category');
+  const [constraintObjects, setConstraintObjects] = useState<string[]>([]);
+  const [constraintCategory, setConstraintCategory] = useState<string>('');
 
   const conflicts = useMemo(() => {
     if (!session) return [];
@@ -149,6 +156,30 @@ export function MergePanel({ image }: { image: ImageRecord }) {
     } catch {
       return new Map();
     }
+  }, [image, session]);
+
+  const planComparison = useMemo(() => {
+    if (!session) return null;
+    try {
+      return compareMergePlans(image, session.aVersion, session.bVersion, session.constraints ?? []);
+    } catch {
+      return null;
+    }
+  }, [image, session]);
+
+  const constraintCandidates = useMemo(() => {
+    if (!session) return [];
+    const ids = new Set<string>();
+    for (const v of image.versions) {
+      if (
+        v.version === session.baseVersion ||
+        v.version === session.aVersion ||
+        v.version === session.bVersion
+      ) {
+        for (const o of v.objects) ids.add(o.id);
+      }
+    }
+    return [...ids];
   }, [image, session]);
 
   if (!session) {
@@ -223,6 +254,93 @@ export function MergePanel({ image }: { image: ImageRecord }) {
         互不冲突的修改已自动保留；{conflicts.length} 处冲突待确认，已确认 {done}/
         {conflicts.length}。进度已自动保存，可随时离开后继续。
       </p>
+      <details className="merge-plans">
+        <summary>合并方案比较（{planComparison?.options.filter((o) => o.feasible).length ?? 0} 份可行）</summary>
+        <div className="constraint-editor">
+          <p className="muted">必须保留约束（类别 / 分组），用于筛选可行方案：</p>
+          {(session.constraints ?? []).map((c) => (
+            <div key={c.id} className="constraint-row">
+              <span>
+                {c.kind === 'keep-category'
+                  ? '物体 ' + c.objectIds.join(', ') + ' 必须保留类别 ' + (categories.find((x) => x.id === c.categoryId)?.name ?? c.categoryId)
+                  : '物体 ' + c.objectIds.join(', ') + ' 必须保持在同一组'}
+              </span>
+              <button onClick={() => removeMergeConstraint(c.id)}>删除</button>
+            </div>
+          ))}
+          <div className="constraint-form">
+            <select value={constraintKind} onChange={(e) => setConstraintKind(e.target.value as MergeConstraintKind)}>
+              <option value="keep-category">保留类别</option>
+              <option value="keep-group">保持同组</option>
+            </select>
+            <select
+              multiple
+              value={constraintObjects}
+              onChange={(e) => setConstraintObjects([...e.target.selectedOptions].map((o) => o.value))}
+            >
+              {constraintCandidates.map((id) => (
+                <option key={id} value={id}>{id}</option>
+              ))}
+            </select>
+            {constraintKind === 'keep-category' && (
+              <select value={constraintCategory} onChange={(e) => setConstraintCategory(e.target.value)}>
+                <option value="">选择类别</option>
+                {categories.map((c) => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+              </select>
+            )}
+            <button
+              disabled={constraintObjects.length === 0 || (constraintKind === 'keep-category' && !constraintCategory)}
+              onClick={() => {
+                addMergeConstraint({
+                  kind: constraintKind,
+                  objectIds: constraintObjects,
+                  categoryId: constraintKind === 'keep-category' ? constraintCategory : undefined,
+                });
+                setConstraintObjects([]);
+              }}
+            >
+              添加约束
+            </button>
+          </div>
+        </div>
+        {planComparison && planComparison.options.length > 1 && (
+          <ul className="plan-list">
+            {planComparison.options.map((option) => (
+              <li key={option.id} className={'plan-option' + (option.feasible ? '' : ' infeasible')}>
+                <div className="plan-head">
+                  <strong>{option.label}</strong>
+                  <span className="muted">
+                    {option.feasible ? '可行' : '不可行'}，落地后待裁决 {option.pendingConflicts.length} 处；
+                    最终物体：{option.finalObjects.map((o) => o.id).join(', ') || '（无）'}
+                  </span>
+                  <button
+                    className="primary"
+                    disabled={!option.feasible}
+                    onClick={() => applyMergePlan(option)}
+                  >
+                    采用该方案
+                  </button>
+                </div>
+                {[...option.duplicateSources, ...option.droppedIndependent, ...option.violations].map((msg) => (
+                  <p key={msg} className="error">{msg}</p>
+                ))}
+              </li>
+            ))}
+          </ul>
+        )}
+        {planComparison && planComparison.incompatibilities.length > 0 && (
+          <div className="incompatibilities">
+            <p className="muted">无法同时满足的决定：</p>
+            {planComparison.incompatibilities.map((inc) => (
+              <p key={inc.decisions.join('&')} className="error">
+                {inc.decisions.join(' 且 ')}：{inc.reason}
+              </p>
+            ))}
+          </div>
+        )}
+      </details>
       {conflicts.length > 0 && (
         <ul className="conflict-list">
           {conflicts.map((c) => (
